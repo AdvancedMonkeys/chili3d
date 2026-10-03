@@ -142,6 +142,8 @@ export class RibbonUI extends HTMLElement {
     static documentTabs = true;
 
     private centerPanel() {
+        // No document tabs: the host names the model itself; the centre stays empty.
+        if (!RibbonUI.documentTabs) return div({ className: style.center });
         const children: (HTMLElement | SVGElement)[] = [
             collection({
                 className: style.views,
