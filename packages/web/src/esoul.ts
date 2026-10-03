@@ -25,12 +25,12 @@ import {
     Logger,
     VisualNode,
 } from "@chili3d/core";
-import { Editor, MainWindow } from "@chili3d/ui";
+import { Editor, MainWindow, RibbonUI } from "@chili3d/ui";
 import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.12";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.13";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -421,6 +421,8 @@ class EsoulAppBuilder extends AppBuilder {
 Editor.autoShowChat = false;
 // A document is always open here; the home screen must not flash while a replay swaps documents.
 MainWindow.homeWhenNoView = false;
+// One model per ExternalSoul instance: no document tabs to open or close.
+RibbonUI.documentTabs = false;
 
 // The host's own light/dark, not the OS's: first paint from the URL, later changes over the bridge.
 applyThemeMode(params.get("theme"));

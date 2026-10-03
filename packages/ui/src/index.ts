@@ -5,3 +5,4 @@ export * from "./dialog";
 export { Editor } from "./editor";
 export * from "./floatPanel";
 export * from "./mainWindow";
+export * from "./ribbon";

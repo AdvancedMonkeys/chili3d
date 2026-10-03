@@ -138,21 +138,28 @@ export class RibbonUI extends HTMLElement {
         });
     }
 
+    /** Whether the title bar offers document tabs (close, new). An embedding host with one model per instance sets it false. */
+    static documentTabs = true;
+
     private centerPanel() {
-        return div(
-            { className: style.center },
+        const children: (HTMLElement | SVGElement)[] = [
             collection({
                 className: style.views,
                 sources: this.app.views,
                 template: (view) => this.createViewItem(view),
             }),
-            svg({
-                className: style.new,
-                icon: "icon-plus",
-                title: I18n.translate("command.doc.new"),
-                onclick: () => PubSub.default.pub("executeCommand", "doc.new"),
-            }),
-        );
+        ];
+        if (RibbonUI.documentTabs) {
+            children.push(
+                svg({
+                    className: style.new,
+                    icon: "icon-plus",
+                    title: I18n.translate("command.doc.new"),
+                    onclick: () => PubSub.default.pub("executeCommand", "doc.new"),
+                }),
+            );
+        }
+        return div({ className: style.center }, ...children);
     }
 
     private createViewItem(view: IView) {
@@ -168,14 +175,18 @@ export class RibbonUI extends HTMLElement {
                 },
             },
             div({ className: style.name }, span({ textContent: new Binding(view.document, "name") })),
-            svg({
-                className: style.close,
-                icon: "icon-times",
-                onclick: (e) => {
-                    e.stopPropagation();
-                    view.close();
-                },
-            }),
+            ...(RibbonUI.documentTabs
+                ? [
+                      svg({
+                          className: style.close,
+                          icon: "icon-times",
+                          onclick: (e: Event) => {
+                              e.stopPropagation();
+                              view.close();
+                          },
+                      }),
+                  ]
+                : []),
         );
     }
 
