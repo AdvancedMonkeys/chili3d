@@ -11,6 +11,7 @@ export default defineConfig({
     devtool: isProduction ? false : "source-map",
     entry: {
         main: "./packages/web/src/index.ts",
+        esoul: "./packages/web/src/esoul.ts",
     },
     experiments: {
         css: true,
@@ -70,7 +71,7 @@ export default defineConfig({
                 {
                     from: resolve(configDir, "public"),
                     globOptions: {
-                        ignore: ["**/**/index.html"],
+                        ignore: ["**/**/index.html", "**/**/esoul.html"],
                     },
                 },
             ],
@@ -83,6 +84,13 @@ export default defineConfig({
         new rspack.HtmlRspackPlugin({
             template: resolve(configDir, "public/index.html"),
             inject: "body",
+            chunks: ["main"],
+        }),
+        new rspack.HtmlRspackPlugin({
+            template: resolve(configDir, "public/esoul.html"),
+            filename: "esoul.html",
+            inject: "body",
+            chunks: ["esoul"],
         }),
     ],
     optimization: {
