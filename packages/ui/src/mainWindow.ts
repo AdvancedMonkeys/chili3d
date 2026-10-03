@@ -69,7 +69,7 @@ export class MainWindow extends HTMLElement implements IWindow {
         await this.fetchIconFont();
 
         this.applyTheme();
-        await this._initHome(app);
+        if (MainWindow.homeWhenNoView) await this._initHome(app);
         this._initEditor(app);
         this._initEventHandlers(app);
     }
