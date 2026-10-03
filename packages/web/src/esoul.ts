@@ -24,12 +24,12 @@ import {
     Logger,
     VisualNode,
 } from "@chili3d/core";
-import { Editor } from "@chili3d/ui";
+import { Editor, MainWindow } from "@chili3d/ui";
 import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.7";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.8";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -409,6 +409,8 @@ class EsoulAppBuilder extends AppBuilder {
 
 // ExternalSoul's assistant is the AI here: chili's own chat stays closed.
 Editor.autoShowChat = false;
+// A document is always open here; the home screen must not flash while a replay swaps documents.
+MainWindow.homeWhenNoView = false;
 
 const loading = new Loading();
 document.body.appendChild(loading);

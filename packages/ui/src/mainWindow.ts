@@ -25,6 +25,8 @@ const quickCommands: CommandKeys[] = ["doc.save", "doc.saveToFile", "edit.undo",
 export class MainWindow extends HTMLElement implements IWindow {
     readonly ribbon: Ribbon;
     private _inited: boolean = false;
+    /** Show the home screen when no view is active. An embedding host that always holds a document sets it false. */
+    static homeWhenNoView = true;
     private _home?: Home;
     private _editor?: Editor;
 
@@ -90,7 +92,9 @@ export class MainWindow extends HTMLElement implements IWindow {
         PubSub.default.sub("showDialog", showDialog);
         PubSub.default.sub("showFloatPanel", showFloatPanel);
         PubSub.default.sub("showPermanent", Permanent.show);
-        PubSub.default.sub("activeViewChanged", (view) => displayHome(app, view === undefined));
+        PubSub.default.sub("activeViewChanged", (view) =>
+            displayHome(app, view === undefined && MainWindow.homeWhenNoView),
+        );
         PubSub.default.sub("displayHome", (show) => displayHome(app, show));
 
         Config.instance.onPropertyChanged(this.handleConfigChanged);
