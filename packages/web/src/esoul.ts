@@ -16,6 +16,7 @@ import type { Tool, ToolResult } from "@chili3d/ai/src/llm/types";
 import { buildTools } from "@chili3d/ai/src/tools";
 import { AppBuilder } from "@chili3d/builder";
 import {
+    Config,
     History,
     type IApplication,
     type IDocument,
