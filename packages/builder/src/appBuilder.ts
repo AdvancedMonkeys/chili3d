@@ -143,6 +143,8 @@ export class AppBuilder {
 
     protected async loadDefaultPlugins(app: IApplication) {
         const urlObj = new URL(window.location.href);
+        urlObj.search = "";
+        urlObj.hash = "";
         const pathParts = urlObj.pathname
             .split("/")
             .map((x) => x.trim())

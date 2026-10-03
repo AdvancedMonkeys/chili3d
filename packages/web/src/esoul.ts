@@ -1,35 +1,42 @@
 // Part of the Chili3d Project, under the AGPL-3.0 License.
 // See LICENSE file in the project root for full license information.
 //
-// The ExternalSoul runtime entry (AdvancedMonkeys fork). A page with the kernel, the parametric
-// engine and a Three viewport — and no ribbon. It is embedded by the ExternalSoul CAD app as a
-// sandboxed iframe and driven over postMessage: the parent replays the model's program list
-// (chili's own `ParametricOp` JSON) and asks the same AI tool handlers the in-app assistant uses
-// (run_program, capture_screenshot, document_variables, …). Nothing here holds a credential; the
-// parent is the only writer of record, and only the origin named in `?parent=` may talk to us.
+// The ExternalSoul runtime entry (AdvancedMonkeys fork): the full Chili3D UI (ribbon, viewport,
+// property panel) plus a postMessage bridge, embedded by the ExternalSoul CAD app as an iframe.
+// Two things flow over the bridge:
+//   - the parent REPLAYS the model's intent (steps: chili's own `ParametricOp` programs, or a
+//     person's earlier edit as a document snapshot) and asks the same AI tool handlers the in-app
+//     assistant uses (run_program, capture_screenshot, document_variables, …);
+//   - every transaction a person commits by hand in this UI is reported back as an EDIT (the
+//     command's name + the serialized document), so the parent can record it on its timeline.
+// Nothing here holds a credential; the parent is the only writer of record, and only the origin
+// named in `?parent=` may talk to us.
 
 import type { Tool, ToolResult } from "@chili3d/ai/src/llm/types";
 import { buildTools } from "@chili3d/ai/src/tools";
 import { AppBuilder } from "@chili3d/builder";
-import { type IApplication, type IDocument, type IView, Logger, VisualNode } from "@chili3d/core";
+import {
+    History,
+    type IApplication,
+    type IDocument,
+    type IHistoryRecord,
+    type INode,
+    Logger,
+    VisualNode,
+} from "@chili3d/core";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.1";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.5";
+const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
 const parentOrigin = params.get("parent");
 
-const viewport = document.getElementById("viewport") as HTMLElement;
-const status = document.getElementById("status") as HTMLElement;
-
 let app: IApplication | undefined;
 let tools: Tool[] = [];
-
-function say(text: string) {
-    status.textContent = text;
-    status.style.display = text ? "block" : "none";
-}
+/** True while the bridge itself mutates the document (a replay, a tool call): those are not a person's edits. */
+let driving = 0;
 
 function post(message: Record<string, unknown>) {
     if (!parentOrigin) return;
@@ -49,85 +56,199 @@ function tool(name: string): Tool {
 }
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<string | ToolResult> {
-    return tool(name).handler(args);
+    driving++;
+    try {
+        return await tool(name).handler(args);
+    } finally {
+        driving--;
+    }
+}
+
+function dropDocument(prev: IDocument | undefined, keep: IDocument) {
+    if (!app || !prev || prev === keep) return;
+    // The UI reads `activeView.document` whenever the view list changes: point it at the kept
+    // document FIRST, then remove the old views, then dispose.
+    const keepView = app.views.filter((v) => v.document === keep)[0];
+    if (keepView) app.activeView = keepView;
+    const views = app.views.filter((x) => x.document === prev);
+    app.views.remove(...views);
+    app.documents.delete(prev);
+    try {
+        (prev as unknown as { dispose?: () => void }).dispose?.();
+    } catch (err) {
+        // chili's Node.disposeInternal reads `document.visual` after the document's own fields are
+        // cleared (a FolderNode child trips it); the kept document is unaffected. Logged, not fatal.
+        Logger.warn(`esoul: previous document not fully disposed: ${(err as Error).message}`);
+    }
+    if (keepView && app.activeView !== keepView) app.activeView = keepView;
 }
 
 /** A fresh document in the viewport. The previous one is dropped WITHOUT the save prompt `close()` shows. */
 async function openFresh(): Promise<IDocument> {
     if (!app) throw new Error("not booted");
-    const prev = app.activeView?.document;
-    const doc = await app.newDocument("esoul");
-    const view = app.activeView as IView & { setDom?(el: HTMLElement): void };
-    view.setDom?.(viewport);
-    if (prev && prev !== doc) {
-        const views = app.views.filter((x) => x.document === prev);
-        app.views.remove(...views);
-        app.documents.delete(prev);
-        (prev as unknown as { dispose?: () => void }).dispose?.();
-        app.activeView = view;
+    driving++;
+    try {
+        const prev = app.activeView?.document;
+        const doc = await app.newDocument("esoul");
+        dropDocument(prev, doc);
+        return doc;
+    } finally {
+        driving--;
+        forgetPendingEdit();
     }
-    return doc;
 }
 
+/** Load a serialized document (a person's earlier edit) in place of the current one. */
+async function openSnapshot(serialized: string): Promise<IDocument> {
+    if (!app) throw new Error("not booted");
+    const prev = app.activeView?.document;
+    driving++;
+    try {
+        const data = JSON.parse(serialized);
+        const doc = await app.loadDocument(data);
+        if (!doc)
+            throw new Error(
+                "the snapshot could not be loaded (its document version does not match this runtime)",
+            );
+        dropDocument(prev, doc);
+        return doc;
+    } finally {
+        driving--;
+        forgetPendingEdit();
+    }
+}
+
+/** Creating ops mint deterministic node ids: `<stepId>:<opId>` — the same on every device, every replay. */
+function withDeterministicIds(stepId: string, ops: unknown[]): unknown[] {
+    return ops.map((raw) => {
+        const op = raw as { op?: string; id?: string; nodeId?: string; body?: string };
+        if (!op || typeof op !== "object" || op.nodeId || !op.id) return raw;
+        const creates = op.op === "sketch" || op.op === "revolve" || (op.op === "extrude" && !op.body);
+        return creates ? { ...op, nodeId: `${stepId}:${op.id}` } : raw;
+    });
+}
+
+type ReplayStep =
+    | { id: string; kind: "program"; ops: unknown[] }
+    | { id: string; kind: "edit"; serialized: string };
 interface ReplayArgs {
     variables?: { name: string; type: string; expression: string }[];
-    programs?: { id: string; ops: unknown[] }[];
+    steps?: ReplayStep[];
+}
+interface Applied {
+    stepId: string;
+    ok: boolean;
+    error?: string;
+    created: unknown[];
+    bodies: unknown[];
 }
 
-/** Rebuild the whole model from intent. Each program's outcome is reported separately; a failure stops the replay there. */
-async function replay(args: ReplayArgs): Promise<ToolResult> {
-    await openFresh();
-    const applied: {
-        programId: string;
-        ok: boolean;
+function isParametricBody(n: INode): boolean {
+    return "featuresJson" in (n as object);
+}
+
+/** The feature lists of every parametric body in the document, as `run_parametric`'s `features` op reports them. */
+async function describeBodies(doc: IDocument): Promise<unknown[]> {
+    const bodies = doc.modelManager.findNodes(isParametricBody);
+    if (bodies.length === 0) return [];
+    const r = await callTool("run_parametric", {
+        ops: bodies.map((b, i) => ({ op: "features", id: `f${i}`, body: b.id })),
+    });
+    const parsed = JSON.parse(typeof r === "string" ? r : r.content) as {
+        bodies?: unknown[];
         error?: string;
-        created: unknown[];
-        bodies: unknown[];
-    }[] = [];
-    if (args.variables && args.variables.length > 0) {
-        const r = await callTool("document_variables", { action: "set", variables: args.variables });
-        const text = typeof r === "string" ? r : r.content;
-        let parsed: { error?: string } = {};
-        try {
-            parsed = JSON.parse(text);
-        } catch {
-            /* a plain sentence */
+    };
+    if (parsed.error) throw new Error(parsed.error);
+    return parsed.bodies ?? [];
+}
+
+/** Rebuild the model from intent, starting at the last snapshot (it contains everything before it). */
+async function replay(args: ReplayArgs): Promise<ToolResult> {
+    driving++;
+    try {
+        const steps = args.steps ?? [];
+        const lastEdit = steps.map((s) => s.kind).lastIndexOf("edit");
+        const applied: Applied[] = [];
+        if (lastEdit >= 0) {
+            const edit = steps[lastEdit] as Extract<ReplayStep, { kind: "edit" }>;
+            try {
+                const doc = await openSnapshot(edit.serialized);
+                applied.push({ stepId: edit.id, ok: true, created: [], bodies: await describeBodies(doc) });
+            } catch (err) {
+                const e = err as Error;
+                applied.push({
+                    stepId: edit.id,
+                    ok: false,
+                    error: `${e.message} | ${String(e.stack ?? "")
+                        .split("\n")
+                        .slice(1, 4)
+                        .join(" | ")}`,
+                    created: [],
+                    bodies: [],
+                });
+                return finish(applied);
+            }
+        } else {
+            await openFresh();
         }
-        if (parsed.error) throw new Error(`variables: ${parsed.error}`);
-    }
-    for (const program of args.programs ?? []) {
-        try {
-            const r = await callTool("run_parametric", { ops: program.ops });
+        if (args.variables && args.variables.length > 0) {
+            const r = await callTool("document_variables", { action: "set", variables: args.variables });
             const text = typeof r === "string" ? r : r.content;
-            const parsed = JSON.parse(text) as { error?: string; created?: unknown[]; bodies?: unknown[] };
-            if (parsed.error) throw new Error(parsed.error);
-            applied.push({
-                programId: program.id,
-                ok: true,
-                created: parsed.created ?? [],
-                bodies: parsed.bodies ?? [],
-            });
-        } catch (err) {
-            applied.push({
-                programId: program.id,
-                ok: false,
-                error: (err as Error).message,
-                created: [],
-                bodies: [],
-            });
-            break;
+            let parsed: { error?: string } = {};
+            try {
+                parsed = JSON.parse(text);
+            } catch {
+                /* a plain sentence */
+            }
+            if (parsed.error) throw new Error(`variables: ${parsed.error}`);
         }
+        for (const step of steps.slice(lastEdit + 1)) {
+            if (step.kind !== "program") continue;
+            try {
+                const r = await callTool("run_parametric", { ops: withDeterministicIds(step.id, step.ops) });
+                const parsed = JSON.parse(typeof r === "string" ? r : r.content) as {
+                    error?: string;
+                    created?: unknown[];
+                    bodies?: unknown[];
+                };
+                if (parsed.error) throw new Error(parsed.error);
+                applied.push({
+                    stepId: step.id,
+                    ok: true,
+                    created: parsed.created ?? [],
+                    bodies: parsed.bodies ?? [],
+                });
+            } catch (err) {
+                applied.push({
+                    stepId: step.id,
+                    ok: false,
+                    error: (err as Error).message,
+                    created: [],
+                    bodies: [],
+                });
+                break;
+            }
+        }
+        return finish(applied);
+    } finally {
+        driving--;
     }
+}
+
+async function finish(applied: Applied[]): Promise<ToolResult> {
     try {
         await callTool("fit_content", {});
     } catch (err) {
         Logger.warn(`fit_content: ${(err as Error).message}`);
     }
-    const shot = await callTool("capture_screenshot", {});
-    return {
-        content: JSON.stringify({ applied, runtimeVersion: RUNTIME_VERSION }),
-        images: typeof shot === "string" ? undefined : shot.images,
-    };
+    let images: ToolResult["images"];
+    try {
+        const shot = await callTool("capture_screenshot", {});
+        images = typeof shot === "string" ? undefined : shot.images;
+    } catch (err) {
+        Logger.warn(`capture_screenshot: ${(err as Error).message}`);
+    }
+    return { content: JSON.stringify({ applied, runtimeVersion: RUNTIME_VERSION }), images };
 }
 
 async function exportModel(args: { format?: string; ids?: string[] }): Promise<ToolResult> {
@@ -177,6 +298,8 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             return exportModel(args as { format?: string; ids?: string[] });
         case "esoul.serialize":
             return JSON.stringify(activeDocument().serialize());
+        case "esoul.bodies":
+            return JSON.stringify({ bodies: await describeBodies(activeDocument()) });
         default:
             return callTool(method, args);
     }
@@ -197,13 +320,72 @@ window.addEventListener("message", async (event: MessageEvent) => {
         const result = await dispatch(method, args);
         post({ id, ok: true, result });
     } catch (err) {
-        post({ id, ok: false, error: (err as Error)?.message ?? String(err) });
+        const e = err as Error;
+        post({
+            id,
+            ok: false,
+            error: e?.message ?? String(err),
+            stack: typeof e?.stack === "string" ? e.stack.split("\n").slice(0, 6).join(" | ") : undefined,
+        });
     }
 });
 
-say("Loading the CAD kernel…");
-if (!parentOrigin)
-    say("This runtime is driven by an embedding page (missing ?parent=<origin>). Loading anyway…");
+// ------------------------------------------------------------------ a person's edits → the parent
+
+let editTimer: ReturnType<typeof setTimeout> | undefined;
+let editLabels: string[] = [];
+
+/** Anything the bridge itself just did is not a person's edit. */
+function forgetPendingEdit() {
+    if (editTimer) clearTimeout(editTimer);
+    editTimer = undefined;
+    editLabels = [];
+}
+
+function summarize(doc: IDocument): string {
+    const top = doc.modelManager.findNodes((n) => n.parent === doc.modelManager.rootNode);
+    const names = top
+        .slice(0, 12)
+        .map(
+            (n) =>
+                `${n.name}${isParametricBody(n) ? " (parametric)" : ""}${n.visible === false ? " (hidden)" : ""}`,
+        );
+    return `${top.length} top-level node${top.length === 1 ? "" : "s"}: ${names.join(", ")}${top.length > 12 ? ", …" : ""}`;
+}
+
+function flushEdit() {
+    editTimer = undefined;
+    const labels = editLabels;
+    editLabels = [];
+    if (!app?.activeView?.document || labels.length === 0) return;
+    const doc = app.activeView.document;
+    try {
+        const serialized = JSON.stringify(doc.serialize());
+        post({
+            type: "edit",
+            label: Array.from(new Set(labels)).join(", "),
+            summary: summarize(doc),
+            serialized,
+        });
+    } catch (err) {
+        Logger.error(`esoul edit capture failed: ${(err as Error).message}`);
+    }
+}
+
+/** Every committed transaction lands in History.add. A burst of them (one gesture) becomes one edit. */
+const originalAdd = History.prototype.add;
+History.prototype.add = function esoulCapturingAdd(this: History, record: IHistoryRecord) {
+    originalAdd.call(this, record);
+    if (driving > 0 || !parentOrigin) return;
+    if (this.isUndoing || this.isRedoing) return;
+    editLabels.push(String((record as { name?: string }).name ?? "edit"));
+    if (editTimer) clearTimeout(editTimer);
+    editTimer = setTimeout(flushEdit, EDIT_DEBOUNCE_MS);
+};
+
+// --------------------------------------------------------------------------------------------- boot
+
+if (!parentOrigin) Logger.warn("esoul runtime: no ?parent=<origin> — the bridge is off; the UI still works.");
 
 // prettier-ignore
 new AppBuilder()
@@ -211,15 +393,15 @@ new AppBuilder()
     .useWasmOcc()
     .useParametric()
     .useThree()
+    .useUI()
     .build()
     .then(async (built) => {
         app = built;
         tools = buildTools();
         await openFresh();
-        say("");
         post({ type: "ready", version: RUNTIME_VERSION, tools: tools.map((t) => t.name) });
     })
     .catch((err: Error) => {
-        say(`The CAD kernel failed to start: ${err.message}`);
         post({ type: "error", error: err.message });
+        alert(`The CAD runtime failed to start: ${err.message}`);
     });

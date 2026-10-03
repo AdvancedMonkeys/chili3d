@@ -63,6 +63,8 @@ export type ParametricOp =
 export interface SketchOp {
     op: "sketch";
     id: string;
+    /** The node id to mint (ExternalSoul passes a deterministic one so a replay on another device yields the same ids). */
+    nodeId?: string;
     name?: string;
     /** A datum plane, or a planar face of an existing node. Defaults to XY. */
     plane?: "XY" | "YZ" | "ZX" | { nodeId: string; faceIndex: number };
@@ -78,6 +80,8 @@ export interface SketchOp {
 export interface ExtrudeOp {
     op: "extrude";
     id: string;
+    /** The node id to mint for a NEW body (ignored when `body` is set). */
+    nodeId?: string;
     name?: string;
     /** The sketch op id, or an existing sketch's node id. */
     sketch: string;
@@ -92,6 +96,8 @@ export interface ExtrudeOp {
 export interface RevolveOp {
     op: "revolve";
     id: string;
+    /** The node id to mint. */
+    nodeId?: string;
     name?: string;
     sketch: string;
     axis: { point: { x: number; y: number; z: number }; direction: { x: number; y: number; z: number } };
@@ -282,7 +288,7 @@ function runSketchOp(state: State, op: SketchOp): void {
     const data = buildSketchData(state.document, op, plane);
     if (refPositions !== undefined) data.refPositions = refPositions;
 
-    const sketch = new SketchNode({ document: state.document, plane, planeRef, data });
+    const sketch = new SketchNode({ document: state.document, plane, planeRef, data, id: op.nodeId });
     state.document.modelManager.addNode(sketch);
     // The node builds its edges lazily and reports failure only through `shape` — this
     // read is both the trigger and the single place a bad sketch can be caught.
@@ -414,9 +420,16 @@ function runExtrudeOp(state: State, op: ExtrudeOp): void {
         ...(op.startOffset !== undefined ? { startOffset: op.startOffset } : {}),
     };
     if (op.body === undefined) {
-        createBody(state, op.id, op.name, [feature], () => {
-            sketch.visible = false;
-        });
+        createBody(
+            state,
+            op.id,
+            op.name,
+            [feature],
+            () => {
+                sketch.visible = false;
+            },
+            op.nodeId,
+        );
         return;
     }
     if (op.operation === undefined) {
@@ -444,9 +457,16 @@ function runRevolveOp(state: State, op: RevolveOp): void {
         axis: { point: { ...op.axis.point }, direction: { ...op.axis.direction } },
         angle: op.angle ?? 360,
     };
-    createBody(state, op.id, op.name, [feature], () => {
-        sketch.visible = false;
-    });
+    createBody(
+        state,
+        op.id,
+        op.name,
+        [feature],
+        () => {
+            sketch.visible = false;
+        },
+        op.nodeId,
+    );
 }
 
 function runEdgeCornerOp(state: State, op: FilletChamferOp): void {
@@ -576,8 +596,9 @@ function createBody(
     name: string | undefined,
     features: FeatureData[],
     afterAdd?: () => void,
+    nodeId?: string,
 ): void {
-    const body = new ParametricBodyNode({ document: state.document, features });
+    const body = new ParametricBodyNode({ document: state.document, features, id: nodeId });
     state.document.modelManager.addNode(body);
     if (name !== undefined) body.name = name;
     afterAdd?.();
