@@ -30,7 +30,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.10";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.11";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -98,7 +98,7 @@ async function openFresh(): Promise<IDocument> {
     driving++;
     try {
         const prev = app.activeView?.document;
-        const doc = await app.newDocument("esoul");
+        const doc = await app.newDocument(DOCUMENT_NAME);
         dropDocument(prev, doc);
         return doc;
     } finally {
@@ -430,15 +430,23 @@ const loading = new Loading();
 loading.style.backgroundColor = "var(--background-color)";
 document.body.appendChild(loading);
 
-/** Title-bar chrome of the standalone app that has no meaning inside ExternalSoul. */
+/** Title-bar chrome of the standalone app that has no meaning inside ExternalSoul: the version chip, the
+ *  GitHub link, the home button, the "new document" plus and the document tab's close — one model, one tab,
+ *  named after the ExternalSoul app instance (`?name=`). */
 function tidyChrome() {
     document.getElementById("appName")?.remove();
     document.querySelector('a[href*="github.com/xiangechen"]')?.remove();
     for (const use of Array.from(document.querySelectorAll("svg use"))) {
         const href = use.getAttribute("href") ?? use.getAttribute("xlink:href") ?? "";
         if (href.endsWith("icon-home")) use.closest("svg")?.parentElement?.remove();
+        else if (href.endsWith("icon-plus") || href.endsWith("icon-times")) {
+            const svg = use.closest("svg");
+            if (svg && svg.closest("[class*=titleBar], [class*=title-bar], [class*=center]")) svg.remove();
+        }
     }
 }
+
+const DOCUMENT_NAME = (params.get("name") ?? "").trim().slice(0, 60) || "Model";
 
 if (!parentOrigin) Logger.warn("esoul runtime: no ?parent=<origin> — the bridge is off; the UI still works.");
 
