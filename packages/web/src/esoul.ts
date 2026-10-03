@@ -30,7 +30,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.9";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.10";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -426,6 +426,8 @@ MainWindow.homeWhenNoView = false;
 applyThemeMode(params.get("theme"));
 
 const loading = new Loading();
+// The stock overlay is a black veil; here it is the host's own surface while the kernel downloads.
+loading.style.backgroundColor = "var(--background-color)";
 document.body.appendChild(loading);
 
 /** Title-bar chrome of the standalone app that has no meaning inside ExternalSoul. */
