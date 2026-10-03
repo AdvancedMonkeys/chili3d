@@ -71,7 +71,7 @@ export class Home extends HTMLElement {
     private async getVideoData(): Promise<VideoData> {
         if (videoDataCache) return videoDataCache;
         try {
-            const response = await fetch("/videos.json");
+            const response = await fetch(new URL("videos.json", window.location.href).href);
             videoDataCache = (await response.json()) as VideoData;
             return videoDataCache;
         } catch {

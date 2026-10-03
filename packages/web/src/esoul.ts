@@ -24,10 +24,11 @@ import {
     Logger,
     VisualNode,
 } from "@chili3d/core";
+import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.5";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.6";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -385,10 +386,33 @@ History.prototype.add = function esoulCapturingAdd(this: History, record: IHisto
 
 // --------------------------------------------------------------------------------------------- boot
 
+/** Ribbon items that make no sense inside ExternalSoul (its own assistant is the AI; no Wechat). */
+const HIDDEN_RIBBON_ITEMS = new Set(["ai.toggleChat", "wechat.group"]);
+
+class EsoulAppBuilder extends AppBuilder {
+    override async getRibbonTabs() {
+        const tabs = await super.getRibbonTabs();
+        return tabs.map((tab) => ({
+            ...tab,
+            groups: tab.groups
+                .map((group) => ({
+                    ...group,
+                    items: group.items.filter(
+                        (item) => typeof item !== "string" || !HIDDEN_RIBBON_ITEMS.has(item),
+                    ),
+                }))
+                .filter((group) => group.items.length > 0),
+        }));
+    }
+}
+
+const loading = new Loading();
+document.body.appendChild(loading);
+
 if (!parentOrigin) Logger.warn("esoul runtime: no ?parent=<origin> — the bridge is off; the UI still works.");
 
 // prettier-ignore
-new AppBuilder()
+new EsoulAppBuilder()
     .useIndexedDB()
     .useWasmOcc()
     .useParametric()
@@ -399,9 +423,11 @@ new AppBuilder()
         app = built;
         tools = buildTools();
         await openFresh();
+        loading.remove();
         post({ type: "ready", version: RUNTIME_VERSION, tools: tools.map((t) => t.name) });
     })
     .catch((err: Error) => {
+        loading.remove();
         post({ type: "error", error: err.message });
         alert(`The CAD runtime failed to start: ${err.message}`);
     });
