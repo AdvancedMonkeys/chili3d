@@ -29,11 +29,17 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.8";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.9";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
 const parentOrigin = params.get("parent");
+
+type ThemeMode = "light" | "dark" | "system";
+function applyThemeMode(mode: unknown) {
+    if (mode !== "light" && mode !== "dark" && mode !== "system") return;
+    Config.instance.themeMode = mode as ThemeMode;
+}
 
 let app: IApplication | undefined;
 let tools: Tool[] = [];
@@ -300,6 +306,9 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             return exportModel(args as { format?: string; ids?: string[] });
         case "esoul.serialize":
             return JSON.stringify(activeDocument().serialize());
+        case "esoul.theme":
+            applyThemeMode(args["mode"]);
+            return JSON.stringify({ ok: true, mode: Config.instance.themeMode });
         case "esoul.bodies":
             return JSON.stringify({ bodies: await describeBodies(activeDocument()) });
         default:
@@ -412,8 +421,21 @@ Editor.autoShowChat = false;
 // A document is always open here; the home screen must not flash while a replay swaps documents.
 MainWindow.homeWhenNoView = false;
 
+// The host's own light/dark, not the OS's: first paint from the URL, later changes over the bridge.
+applyThemeMode(params.get("theme"));
+
 const loading = new Loading();
 document.body.appendChild(loading);
+
+/** Title-bar chrome of the standalone app that has no meaning inside ExternalSoul. */
+function tidyChrome() {
+    document.getElementById("appName")?.remove();
+    document.querySelector('a[href*="github.com/xiangechen"]')?.remove();
+    for (const use of Array.from(document.querySelectorAll("svg use"))) {
+        const href = use.getAttribute("href") ?? use.getAttribute("xlink:href") ?? "";
+        if (href.endsWith("icon-home")) use.closest("svg")?.parentElement?.remove();
+    }
+}
 
 if (!parentOrigin) Logger.warn("esoul runtime: no ?parent=<origin> — the bridge is off; the UI still works.");
 
@@ -430,6 +452,7 @@ new EsoulAppBuilder()
         tools = buildTools();
         await openFresh();
         loading.remove();
+        tidyChrome();
         post({ type: "ready", version: RUNTIME_VERSION, tools: tools.map((t) => t.name) });
     })
     .catch((err: Error) => {
