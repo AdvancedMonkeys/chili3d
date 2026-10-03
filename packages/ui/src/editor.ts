@@ -35,6 +35,9 @@ export class Editor extends HTMLElement {
     private _isResizingSidebar: boolean = false;
     private _sidebarEl: HTMLDivElement | null = null;
 
+    /** Whether the AI chat docks open when the editor first shows. An embedding host with its own assistant sets it false. */
+    static autoShowChat = true;
+
     constructor(
         readonly app: IApplication,
         readonly ribbonContent: Ribbon,
@@ -44,7 +47,7 @@ export class Editor extends HTMLElement {
         viewport.classList.add(style.viewport);
         this._viewportContainer = div({ className: style.viewportContainer }, viewport);
         this.render();
-        this.showChat();
+        if (Editor.autoShowChat) this.showChat();
     }
 
     private render() {
