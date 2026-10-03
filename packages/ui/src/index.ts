@@ -2,5 +2,6 @@
 // See LICENSE file in the project root for full license information.
 
 export * from "./dialog";
+export { Editor } from "./editor";
 export * from "./floatPanel";
 export * from "./mainWindow";
