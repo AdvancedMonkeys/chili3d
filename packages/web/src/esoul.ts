@@ -40,7 +40,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.33";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.34";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -653,7 +653,11 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
     driving++;
     try {
         const steps = args.steps ?? [];
+        const t0 = performance.now();
+        const phase = (what: string) =>
+            console.info(`[esoul] replay ${what} at ${Math.round(performance.now() - t0)} ms`);
         await resolveStepUrls(steps);
+        phase(`inputs resolved (${steps.length} step(s))`);
         const lastEdit = steps.map((s) => s.kind).lastIndexOf("edit");
         const applied: Applied[] = [];
         if (lastEdit >= 0) {
@@ -662,7 +666,9 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
                 if (edit.serialized === undefined)
                     throw new Error("the edit step carries no snapshot (neither serialized nor url)");
                 const doc = await openSnapshot(edit.serialized);
+                phase(`snapshot "${edit.id}" opened (${edit.serialized.length} chars)`);
                 applied.push({ stepId: edit.id, ok: true, created: [], bodies: await describeBodies(doc) });
+                phase("bodies described");
             } catch (err) {
                 const e = err as Error;
                 applied.push({
@@ -691,6 +697,7 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
             }
             if (parsed.error) throw new Error(`variables: ${parsed.error}`);
         }
+        phase("variables set");
         for (const step of steps.slice(lastEdit + 1)) {
             if (step.kind !== "program") continue;
             try {
@@ -725,6 +732,7 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
                 break;
             }
         }
+        phase("steps applied; answering");
         return finish(applied);
     } finally {
         driving--;
