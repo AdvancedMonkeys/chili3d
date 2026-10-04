@@ -25,6 +25,11 @@ jobs:
       - run: npm run build
         env:
           NODE_ENV: production
+      # The runtime's own contract tests against the build that is about to be published: a runtime that breaks
+      # the bridge (URL inputs, chunked exports, describe) or a CAD scenario never reaches a user's tab.
+      - run: npm run test:runtime
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

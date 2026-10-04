@@ -21,19 +21,25 @@ import {
     I18n,
     type IApplication,
     type IDocument,
+    type IEdge,
+    type IFace,
     type IHistoryRecord,
     type INode,
     type IShape,
+    type ISurface,
+    type IWire,
     Logger,
     Matrix4,
+    ShapeTypes,
     VisualNode,
+    type XYZ,
 } from "@chili3d/core";
 import { Editor, MainWindow, RibbonUI } from "@chili3d/ui";
 import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.28";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.29";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -286,6 +292,231 @@ function measure(args: { nodes?: string[]; pairs?: [string, string][] }): string
         }
     });
     return JSON.stringify({ nodes, pairs });
+}
+
+// ── esoul.describe: what a body IS, read from the kernel ───────────────────────────────────────────────────────
+// Building the teddy's switch mount (2026-10-04) meant finding the lid's three screw holes with a 725-pin probe
+// grid and a face-by-face bounding-box sweep over three bridge calls. This answers in one: every planar face with
+// its normal and level, every cylindrical face as a HOLE (concave — the body is outside the cylinder) or a BOSS
+// (convex), with the axis, radius and extent, so an agent reads "Ø2.7 through-hole at (14, 19.22), z −14..2" and
+// designs to it. World space, like esoul.measure.
+
+type DescribedPlane = { kind: "plane"; normal: XYZ; point: XYZ; area: number; bbox: { min: XYZ; max: XYZ } };
+type DescribedCylinder = {
+    kind: "hole" | "boss";
+    radius: number;
+    diameter: number;
+    axis: XYZ;
+    centre: XYZ;
+    length: number;
+    area: number;
+    bbox: { min: XYZ; max: XYZ };
+};
+type DescribedOther = { kind: string; area: number; bbox: { min: XYZ; max: XYZ } };
+
+const xyz = (p: XYZ): XYZ => ({ x: r3(p.x), y: r3(p.y), z: r3(p.z) }) as XYZ;
+function bboxOf(shape: IShape): { min: XYZ; max: XYZ } {
+    const bb = shape.boundingBox();
+    return { min: xyz(bb.min as XYZ), max: xyz(bb.max as XYZ) };
+}
+/** The face's outward normal at one of its own points (BRepGProp_Face honours a reversed face). */
+function faceNormalAt(face: IFace, surface: ISurface, p: XYZ): XYZ | undefined {
+    const uv = surface.parameter(p, 0.5);
+    if (!uv) return undefined;
+    const [, n] = face.normal(uv.u, uv.v);
+    return n;
+}
+function firstPointOf(face: IFace): XYZ | undefined {
+    const wire = face.outerWire() as IWire | undefined;
+    const edges = (wire?.edgeLoop() ?? []) as IEdge[];
+    const e = edges[0];
+    if (!e) return undefined;
+    // the middle of the first edge: a point of the face that is not a corner (corners sit on two surfaces)
+    const a = e.firstParameter();
+    const b = e.lastParameter();
+    return e.pointAt((a + b) / 2);
+}
+/** A STEP face usually sits on a TRIMMED surface (or an offset one): the geometry that says "cylinder" is the basis. */
+function basisOf(s: ISurface): { basis: ISurface; owned: boolean } {
+    const o = s as unknown as { basisSurface?: unknown };
+    if (typeof o.basisSurface === "function") {
+        const b = (o.basisSurface as () => ISurface)();
+        const inner = basisOf(b);
+        if (inner.basis !== b) (b as unknown as { dispose?: () => void }).dispose?.();
+        return { basis: inner.basis, owned: true };
+    }
+    if (o.basisSurface && typeof o.basisSurface === "object")
+        return { basis: o.basisSurface as ISurface, owned: false };
+    return { basis: s, owned: false };
+}
+const surfaceKind = (s: ISurface): "plane" | "cylinder" | "cone" | "sphere" | "torus" | "other" => {
+    if (s.isPlanar()) return "plane";
+    const o = s as unknown as Record<string, unknown>;
+    if ("semiAngle" in o) return "cone";
+    if ("majorRadius" in o) return "torus";
+    if (!("radius" in o) || !("axis" in o)) return "other";
+    // a cylinder and a sphere both carry radius + axis: a cylinder runs forever along v, a sphere's v is ±π/2
+    try {
+        const b = s.bounds();
+        return !Number.isFinite(b.v1) || Math.abs(b.v1) > 1e5 ? "cylinder" : "sphere";
+    } catch {
+        return "other";
+    }
+};
+
+function describeOne(node: INode, maxFaces: number): Record<string, unknown> {
+    const w = worldShape(node);
+    if (!w) return { id: node.id, name: node.name, error: "a node without a shape" };
+    try {
+        const faces = w.shape.findSubShapes(ShapeTypes.face) as IFace[];
+        const planes: DescribedPlane[] = [];
+        const cylinders: DescribedCylinder[] = [];
+        const other: DescribedOther[] = [];
+        for (const face of faces) {
+            let surface: ISurface | undefined;
+            let basis: { basis: ISurface; owned: boolean } | undefined;
+            try {
+                surface = face.surface();
+                basis = basisOf(surface);
+                const kind = surfaceKind(basis.basis);
+                const area = r3(face.area());
+                const bbox = bboxOf(face);
+                if (kind === "plane") {
+                    const p = firstPointOf(face);
+                    const n = p ? faceNormalAt(face, surface, p) : undefined;
+                    const c = {
+                        x: (bbox.min.x + bbox.max.x) / 2,
+                        y: (bbox.min.y + bbox.max.y) / 2,
+                        z: (bbox.min.z + bbox.max.z) / 2,
+                    } as XYZ;
+                    planes.push({
+                        kind: "plane",
+                        normal: n ? xyz(n) : ({ x: 0, y: 0, z: 0 } as XYZ),
+                        point: xyz(c),
+                        area,
+                        bbox,
+                    });
+                } else if (kind === "cylinder") {
+                    const cyl = basis.basis as unknown as { radius: number; axis: XYZ; location: XYZ };
+                    const p = firstPointOf(face);
+                    const n = p ? faceNormalAt(face, surface, p) : undefined;
+                    let concave = false;
+                    if (p && n) {
+                        // radial = the point's offset from the axis line; a hole's outward normal points INTO the axis
+                        const d = {
+                            x: p.x - cyl.location.x,
+                            y: p.y - cyl.location.y,
+                            z: p.z - cyl.location.z,
+                        };
+                        const t = d.x * cyl.axis.x + d.y * cyl.axis.y + d.z * cyl.axis.z;
+                        const radial = {
+                            x: d.x - t * cyl.axis.x,
+                            y: d.y - t * cyl.axis.y,
+                            z: d.z - t * cyl.axis.z,
+                        };
+                        concave = radial.x * n.x + radial.y * n.y + radial.z * n.z < 0;
+                    }
+                    const c = {
+                        x: (bbox.min.x + bbox.max.x) / 2,
+                        y: (bbox.min.y + bbox.max.y) / 2,
+                        z: (bbox.min.z + bbox.max.z) / 2,
+                    };
+                    // the centre of the face's extent, dropped onto the axis line
+                    const dc = { x: c.x - cyl.location.x, y: c.y - cyl.location.y, z: c.z - cyl.location.z };
+                    const tc = dc.x * cyl.axis.x + dc.y * cyl.axis.y + dc.z * cyl.axis.z;
+                    const centre = {
+                        x: cyl.location.x + tc * cyl.axis.x,
+                        y: cyl.location.y + tc * cyl.axis.y,
+                        z: cyl.location.z + tc * cyl.axis.z,
+                    } as XYZ;
+                    const ext = [bbox.max.x - bbox.min.x, bbox.max.y - bbox.min.y, bbox.max.z - bbox.min.z];
+                    const ax = [Math.abs(cyl.axis.x), Math.abs(cyl.axis.y), Math.abs(cyl.axis.z)];
+                    const length = r3(ext[0] * ax[0] + ext[1] * ax[1] + ext[2] * ax[2]);
+                    cylinders.push({
+                        kind: concave ? "hole" : "boss",
+                        radius: r3(cyl.radius),
+                        diameter: r3(cyl.radius * 2),
+                        axis: xyz(cyl.axis),
+                        centre: xyz(centre),
+                        length,
+                        area,
+                        bbox,
+                    });
+                } else {
+                    other.push({ kind, area, bbox });
+                }
+            } catch (err) {
+                other.push({
+                    kind: `unreadable (${(err as Error).message.slice(0, 60)})`,
+                    area: 0,
+                    bbox: bboxOf(face),
+                });
+            } finally {
+                if (basis?.owned) (basis.basis as unknown as { dispose?: () => void }).dispose?.();
+                (surface as unknown as { dispose?: () => void } | undefined)?.dispose?.();
+            }
+        }
+        // Holes first (what an agent attaches to), biggest planes first; the same hole's two half-faces merge.
+        const merged: DescribedCylinder[] = [];
+        for (const c of cylinders.sort((a, b) =>
+            a.kind === b.kind ? b.area - a.area : a.kind === "hole" ? -1 : 1,
+        )) {
+            const same = merged.find(
+                (m) =>
+                    m.kind === c.kind &&
+                    Math.abs(m.radius - c.radius) < 0.005 &&
+                    Math.abs(m.centre.x - c.centre.x) +
+                        Math.abs(m.centre.y - c.centre.y) +
+                        Math.abs(m.centre.z - c.centre.z) <
+                        0.05,
+            );
+            if (same) {
+                same.area = r3(same.area + c.area);
+                same.bbox = {
+                    min: {
+                        x: Math.min(same.bbox.min.x, c.bbox.min.x),
+                        y: Math.min(same.bbox.min.y, c.bbox.min.y),
+                        z: Math.min(same.bbox.min.z, c.bbox.min.z),
+                    } as XYZ,
+                    max: {
+                        x: Math.max(same.bbox.max.x, c.bbox.max.x),
+                        y: Math.max(same.bbox.max.y, c.bbox.max.y),
+                        z: Math.max(same.bbox.max.z, c.bbox.max.z),
+                    } as XYZ,
+                };
+            } else merged.push({ ...c });
+        }
+        planes.sort((a, b) => b.area - a.area);
+        other.sort((a, b) => b.area - a.area);
+        const extents = worldExtents(node);
+        return {
+            id: node.id,
+            name: node.name,
+            ...(extents ?? {}),
+            faces: faces.length,
+            holes: merged.filter((c) => c.kind === "hole").slice(0, maxFaces),
+            bosses: merged.filter((c) => c.kind === "boss").slice(0, maxFaces),
+            planes: planes.slice(0, maxFaces),
+            other: other.slice(0, Math.min(12, maxFaces)),
+            truncated: merged.length > maxFaces || planes.length > maxFaces || other.length > 12,
+        };
+    } finally {
+        disposeOwned(w);
+    }
+}
+
+/** esoul.describe {nodes, maxFaces?}: a read-only account of each body's faces — holes, bosses, planes — in world space. */
+function describe(args: { nodes?: string[]; maxFaces?: number }): string {
+    const doc = activeDocument();
+    const maxFaces = Math.max(1, Math.min(200, Math.floor(Number(args.maxFaces ?? 40))));
+    const ids = args.nodes ?? [];
+    if (ids.length === 0) throw new Error("esoul.describe needs nodes: [node ids]");
+    const bodies = ids.map((id) => {
+        const n = doc.modelManager.findNodes((x) => x.id === id)[0];
+        if (!n) throw new Error(`no node "${id}" in the document`);
+        return describeOne(n, maxFaces);
+    });
+    return JSON.stringify({ bodies });
 }
 
 /** Rebuild the model from intent, starting at the last snapshot (it contains everything before it). */
@@ -550,6 +781,8 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             return JSON.stringify({ ok: true, mode: Config.instance.themeMode });
         case "esoul.bodies":
             return JSON.stringify({ bodies: await describeBodies(activeDocument()) });
+        case "esoul.describe":
+            return describe(args as { nodes?: string[]; maxFaces?: number });
         case "esoul.measure":
             return measure(args as { nodes?: string[]; pairs?: [string, string][] });
         default:

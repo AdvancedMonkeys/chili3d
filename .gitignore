@@ -9,3 +9,5 @@ CMakeUserPresets.json
 types
 # written by scripts/write-runtime-version.mjs at build
 public/version.json
+
+packages/web/esoul-tests/out/
