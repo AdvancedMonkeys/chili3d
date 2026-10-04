@@ -3,10 +3,10 @@
     "version": "0.7.1",
     "description": "",
     "documentVersion": "0.7.1",
-    "author": "仙阁",
+    "author": "\u4ed9\u9601",
     "type": "module",
     "scripts": {
-        "build": "rspack build && node scripts/build-plugins.mjs",
+        "build": "node scripts/write-runtime-version.mjs && rspack build && node scripts/build-plugins.mjs",
         "build:wasm": "cd cpp && cmake --preset release && cmake --build --preset release",
         "build:types": "node scripts/generate_types.mjs",
         "check": "biome check --write",

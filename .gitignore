@@ -7,3 +7,5 @@ coverage
 .clang-format
 CMakeUserPresets.json
 types
+# written by scripts/write-runtime-version.mjs at build
+public/version.json
