@@ -889,13 +889,20 @@ function bytesOfBase64(text: string): Uint8Array {
 }
 
 function runImportOp(state: State, op: ImportOp): void {
-    const shapes: { shape: IShape; name?: string }[] = [];
+    // Every solid becomes BRep text FIRST; the converter's own nodes are then removed and disposed. They are born
+    // under a folder that is never added to the model tree, yet the visual context draws them (the add record fires
+    // through the document) — an imported part used to be drawn twice: once as this untracked, uncoloured ghost at
+    // the file's own position and once as the body the program owns.
+    const parts: { brep: string; name?: string }[] = [];
     if (op.format === ".brep" || op.brep !== undefined) {
         const text = op.brep ?? (op.base64 ? new TextDecoder().decode(bytesOfBase64(op.base64)) : "");
         if (!text) throw new Error("import: a .brep needs `brep` text (or base64 of it)");
         const r = shapeConverter.convertFromBrep(text);
         if (!r.isOk) throw new Error(`import: the BRep could not be read: ${r.error}`);
-        shapes.push({ shape: r.value });
+        const back = shapeConverter.convertToBrep(r.value);
+        r.value.dispose();
+        if (!back.isOk) throw new Error(`import: the BRep could not be kept: ${back.error}`);
+        parts.push({ brep: back.value });
     } else {
         if (!op.base64) throw new Error(`import: ${op.format} needs the file's bytes in \`base64\``);
         const bytes = bytesOfBase64(op.base64);
@@ -905,30 +912,42 @@ function runImportOp(state: State, op: ImportOp): void {
                 : shapeConverter.convertFromSTEP(state.document, bytes);
         if (!r.isOk) throw new Error(`import: the ${op.format} file could not be read: ${r.error}`);
         const folder = r.value;
-        const walk = (n: INode | undefined): void => {
+        const leaves: { node: INode; parent: INode }[] = [];
+        const walk = (parent: INode, n: INode | undefined): void => {
             for (let c = n; c !== undefined; c = c.nextSibling) {
-                const sn = c as {
+                const sn = c as unknown as {
                     shape?: { isOk: boolean; value: IShape };
                     firstChild?: INode;
                     name?: string;
                 };
-                if (sn.shape?.isOk) shapes.push({ shape: sn.shape.value, name: sn.name });
-                else if (sn.firstChild) walk(sn.firstChild);
+                if (sn.shape?.isOk) {
+                    const brep = shapeConverter.convertToBrep(sn.shape.value);
+                    if (!brep.isOk)
+                        throw new Error(
+                            `import: part ${parts.length + 1} could not be kept as BRep: ${brep.error}`,
+                        );
+                    parts.push({ brep: brep.value, name: sn.name });
+                } else if (sn.firstChild) walk(c, sn.firstChild);
+                leaves.push({ node: c, parent });
             }
         };
-        walk(folder.firstChild);
-        if (shapes.length === 0) throw new Error(`import: no solid found in the ${op.format} file`);
+        walk(folder, folder.firstChild);
+        // deepest first: a child leaves its parent before the parent leaves the folder
+        for (const { node, parent } of leaves.reverse()) {
+            (parent as unknown as { remove(...items: INode[]): void }).remove(node);
+            node.dispose();
+        }
+        folder.dispose();
+        if (parts.length === 0) throw new Error(`import: no solid found in the ${op.format} file`);
     }
     const base = op.name ?? "Import";
-    shapes.forEach((entry, i) => {
-        const brep = shapeConverter.convertToBrep(entry.shape);
-        if (!brep.isOk) throw new Error(`import: part ${i + 1} could not be kept as BRep: ${brep.error}`);
+    parts.forEach((entry, i) => {
         const id = i === 0 ? op.id : `${op.id}:${i + 1}`;
         const nodeId = op.nodeId === undefined ? undefined : i === 0 ? op.nodeId : `${op.nodeId}:${i + 1}`;
         const featureId =
             op.featureId === undefined ? Id.generate() : i === 0 ? op.featureId : `${op.featureId}:${i + 1}`;
         const name =
-            shapes.length === 1
+            parts.length === 1
                 ? base
                 : entry.name && entry.name !== "undefined"
                   ? entry.name
@@ -937,7 +956,7 @@ function runImportOp(state: State, op: ImportOp): void {
             state,
             id,
             name,
-            [{ id: featureId, type: "base", brep: brep.value, source: { format: op.format } }],
+            [{ id: featureId, type: "base", brep: entry.brep, source: { format: op.format } }],
             undefined,
             nodeId,
         );
