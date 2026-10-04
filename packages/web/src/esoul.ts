@@ -33,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.21";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.22";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -593,6 +593,7 @@ document.body.appendChild(loading);
 function tidyChrome() {
     document.getElementById("appName")?.remove();
     tidyStatusBar();
+    phoneLayout();
     document.querySelector('a[href*="github.com/xiangechen"]')?.remove();
     for (const use of Array.from(document.querySelectorAll("svg use"))) {
         const href = use.getAttribute("href") ?? use.getAttribute("xlink:href") ?? "";
@@ -621,6 +622,166 @@ function settleView(): void {
     const h = el.clientHeight;
     if (w > 0 && h > 0) view.resize(w, h);
     view.update();
+}
+
+/**
+ * The phone layout. Chili hides the Items/Properties sidebar under 680 px (display: none) and has no
+ * way back to it; the ribbon's groups can be swiped but nothing says so. Here (the pattern of the
+ * platform's Block Notes and My Computer apps): a round button over the viewport opens the sidebar
+ * as a DRAWER over the content with a scrim; a close button in the drawer and a tap on the scrim put
+ * it away. Wide again: every override is removed and chili's own layout returns.
+ */
+const NARROW_PX = 680;
+let phoneUi:
+    | {
+          button: HTMLButtonElement;
+          scrim: HTMLDivElement;
+          close: HTMLButtonElement;
+          observer?: ResizeObserver;
+      }
+    | undefined;
+// Inline styles on the strokes: chili's stylesheet fills svg shapes, and a stylesheet beats a presentation attribute.
+const PANEL_ICON =
+    '<svg viewBox="0 0 24 24" width="18" height="18" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="3" width="18" height="18" rx="2" style="fill:none;stroke:currentColor"/><path d="M9 3v18" style="fill:none;stroke:currentColor"/></svg>';
+function phoneParts():
+    | { root: HTMLElement; content: HTMLElement; sidebar: HTMLElement; viewport: HTMLElement }
+    | undefined {
+    const editor = document.querySelector("chili-editor");
+    const root = editor?.firstElementChild;
+    if (!(root instanceof HTMLElement) || root.children.length < 2) return undefined;
+    const content = root.children[1];
+    if (!(content instanceof HTMLElement) || content.children.length < 2) return undefined;
+    const sidebar = content.children[0];
+    const viewport = content.children[1];
+    if (!(sidebar instanceof HTMLElement) || !(viewport instanceof HTMLElement)) return undefined;
+    return { root, content, sidebar, viewport };
+}
+function setDrawer(open: boolean): void {
+    const parts = phoneParts();
+    if (!parts || !phoneUi) return;
+    parts.sidebar.style.display = open ? "flex" : "none";
+    phoneUi.scrim.style.display = open ? "block" : "none";
+    phoneUi.button.style.display = open ? "none" : "flex";
+}
+function phoneLayout(attempt = 0): void {
+    const parts = phoneParts();
+    if (!parts) {
+        if (attempt < 40) setTimeout(() => phoneLayout(attempt + 1), 250);
+        return;
+    }
+    const { root, content, sidebar, viewport } = parts;
+    if (!phoneUi) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute("aria-label", "Show the items and properties");
+        button.title = "Items and properties";
+        button.innerHTML = PANEL_ICON;
+        // Bottom-left, clear of chili's view-mode label at the top-left (My Computer's bottom-left button is the precedent).
+        Object.assign(button.style, {
+            position: "absolute",
+            left: "10px",
+            bottom: "10px",
+            zIndex: "5",
+            width: "36px",
+            height: "36px",
+            borderRadius: "10px",
+            border: "1px solid var(--border-color)",
+            background: "var(--panel-background-color)",
+            color: "var(--foreground-color)",
+            display: "none",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            boxShadow: "0 4px 14px -6px rgba(0,0,0,0.45)",
+            touchAction: "manipulation",
+        });
+        button.addEventListener("click", () => setDrawer(true));
+        const scrim = document.createElement("div");
+        Object.assign(scrim.style, {
+            position: "absolute",
+            inset: "0",
+            zIndex: "30",
+            background: "rgba(0,0,0,0.35)",
+            display: "none",
+        });
+        scrim.addEventListener("click", () => setDrawer(false));
+        const close = document.createElement("button");
+        close.type = "button";
+        close.setAttribute("aria-label", "Close the items and properties");
+        close.textContent = "\u00d7";
+        Object.assign(close.style, {
+            position: "absolute",
+            right: "8px",
+            top: "6px",
+            zIndex: "2",
+            width: "32px",
+            height: "32px",
+            borderRadius: "8px",
+            border: "1px solid var(--border-color)",
+            background: "var(--panel-background-color)",
+            color: "var(--foreground-color)",
+            fontSize: "20px",
+            lineHeight: "1",
+            display: "none",
+            cursor: "pointer",
+            touchAction: "manipulation",
+        });
+        close.addEventListener("click", () => setDrawer(false));
+        viewport.append(button);
+        content.append(scrim);
+        sidebar.prepend(close);
+        phoneUi = { button, scrim, close };
+        phoneUi.observer = new ResizeObserver(() => phoneLayout());
+        phoneUi.observer.observe(root);
+    }
+    const narrow = root.clientWidth > 0 && root.clientWidth < NARROW_PX;
+    // chili's narrow stylesheet hides the Items tree (chili-project-view) and keeps the sidebar's edge resizer:
+    // inside the drawer the tree is the point, and there is no edge to drag.
+    const tree = sidebar.querySelector("chili-project-view") as HTMLElement | null;
+    const resizer = Array.from(sidebar.children).find((c) => c.tagName === "DIV" && c !== phoneUi?.close) as
+        | HTMLElement
+        | undefined;
+    if (narrow) {
+        Object.assign(sidebar.style, {
+            position: "absolute",
+            top: "0",
+            left: "0",
+            bottom: "0",
+            width: "min(85%, 360px)",
+            maxWidth: "none",
+            zIndex: "31",
+            boxShadow: "0 0 24px rgba(0,0,0,0.5)",
+            borderRight: "1px solid var(--border-color)",
+            paddingTop: "40px",
+        });
+        if (tree) tree.style.display = "flex";
+        if (resizer) resizer.style.display = "none";
+        phoneUi.close.style.display = "flex";
+        phoneUi.close.style.alignItems = "center";
+        phoneUi.close.style.justifyContent = "center";
+        if (sidebar.style.display !== "flex") setDrawer(false);
+    } else {
+        for (const k of [
+            "position",
+            "top",
+            "left",
+            "bottom",
+            "max-width",
+            "z-index",
+            "box-shadow",
+            "border-right",
+            "padding-top",
+            "display",
+        ])
+            sidebar.style.removeProperty(k);
+        // chili set the sidebar's width inline at render; a drawer width must not survive into the desktop layout
+        if (sidebar.style.width.startsWith("min(")) sidebar.style.removeProperty("width");
+        if (tree) tree.style.removeProperty("display");
+        if (resizer) resizer.style.removeProperty("display");
+        phoneUi.close.style.display = "none";
+        phoneUi.scrim.style.display = "none";
+        phoneUi.button.style.display = "none";
+    }
 }
 
 function tidyStatusBar(attempt = 0): void {
