@@ -234,6 +234,16 @@ export class ParametricBodyNode
      */
     private syncConsumedTools(): void {
         if (this.document.history.disabled) return;
+        this.adoptConsumedTools();
+    }
+
+    /**
+     * Adopts the consumed boolean tools NOW, history or not. A program replayed with history off (the
+     * esoul runtime's headless replay) never ran the hook above, so every cutter stayed a drawn top-level
+     * body — the Keyboard teddy's exploded view showed its hat's hollow and its skirt's window cutters
+     * floating at the head (2026-10-04). `runBooleanOp` calls this after it appends the feature.
+     */
+    adoptConsumedTools(): void {
         const desired = new Set(
             this.features
                 .filter((x): x is BooleanFeatureData => x.type === "boolean" && x.consumeTools !== false)

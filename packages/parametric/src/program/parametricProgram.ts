@@ -775,7 +775,9 @@ function runBooleanOp(state: State, op: BooleanOp): void {
         toolIds: tools.map((tool) => tool.id),
         ...(op.consumeTools === false ? { consumeTools: false } : {}),
     });
-    // The body adopts the tools itself (`syncConsumedTools`); this only reports it.
+    // The body adopts the tools (they leave the scene; a consumed tool is not a body of the model). The property
+    // hook does this only while history is on; a headless replay runs with it off, so it is asked for here.
+    if (op.consumeTools !== false) body.adoptConsumedTools();
     for (const tool of tools) {
         state.out.consumed.push({ nodeId: tool.id, name: tool.name, ownerId: body.id });
     }

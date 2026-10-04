@@ -1092,6 +1092,91 @@ const tests = {
         if (!bin.fileName.endsWith(".stl")) return log.fail("a binary STL still ends in .stl");
         return log.ok();
     },
+    // E1 — esoul.explode: a VIEW-ONLY explode moves each part's drawn body by factor × k and leaves the model alone.
+    async E1(log) {
+        const parts = [
+            { node: "e:plate", k: 1 },
+            { node: "e:cap", k: 2 },
+        ];
+        const r = await replay([
+            {
+                id: "e",
+                ops: [
+                    {
+                        op: "sketch",
+                        id: "s",
+                        plane: "XY",
+                        entities: [{ type: "circle", params: [0, 0, 10] }],
+                    },
+                    { op: "extrude", id: "plate", sketch: "s", name: "Plate", depth: 3 },
+                    {
+                        op: "sketch",
+                        id: "s2",
+                        plane: { base: "XY", offset: 3 },
+                        entities: [{ type: "circle", params: [0, 0, 4] }],
+                    },
+                    { op: "extrude", id: "cap", sketch: "s2", name: "Cap", depth: 5 },
+                ],
+            },
+        ]);
+        if (r.failed.length) return log.fail(r.failed[0].error);
+        const x = await rpc("esoul.explode", { factor: 50, parts });
+        if (!x.ok) return log.fail(`explode: ${x.error}`);
+        const moved = JSON.parse(content(x)).moved;
+        log.note(`moved ${JSON.stringify(moved)}`);
+        if (moved.length !== 2 || moved[1].dz !== 100)
+            return log.fail("the cap did not move by 100 (factor 50 × k 2)");
+        const m = await rpc("esoul.measure", { nodes: ["e:cap"], pairs: [] });
+        const bb = JSON.parse(content(m)).nodes[0].bbox;
+        if (Math.abs(bb.min.z - 3) > 1e-6)
+            return log.fail(`the model moved too (cap z ${bb.min.z}); explode is a view`);
+        const back = await rpc("esoul.explode", { factor: 0, parts });
+        if (!back.ok || JSON.parse(content(back)).moved[1].dz !== 0)
+            return log.fail("factor 0 did not put the cap back");
+        const bad = await rpc("esoul.explode", { factor: 1, parts: [{ node: "e:nothing", k: 1 }] });
+        if (bad.ok) return log.fail("an unknown node was accepted");
+        return log.ok();
+    },
+    // E2 — a boolean CONSUMES its tools: the cutter leaves the top level (it sits under the body, undrawn) and
+    //      the model's bodies do not list it. The teddy's exploded view had every cutter floating at the head.
+    async E2(log) {
+        const r = await replay([
+            {
+                id: "b",
+                ops: [
+                    {
+                        op: "sketch",
+                        id: "s",
+                        plane: "XY",
+                        entities: [{ type: "circle", params: [0, 0, 10] }],
+                    },
+                    { op: "extrude", id: "plate", sketch: "s", name: "Plate", depth: 3 },
+                    {
+                        op: "sketch",
+                        id: "s2",
+                        plane: { base: "XY", offset: -1 },
+                        entities: [{ type: "circle", params: [0, 0, 2] }],
+                    },
+                    { op: "extrude", id: "drill", sketch: "s2", name: "Drill", depth: 5 },
+                    { op: "boolean", id: "hole", body: "plate", operation: "cut", tools: ["drill"] },
+                ],
+            },
+        ]);
+        if (r.failed.length) return log.fail(r.failed[0].error);
+        const names = r.applied[0].bodies.map((x) => x.name);
+        log.note(`bodies ${JSON.stringify(names)}`);
+        if (names.includes("Drill")) return log.fail("the consumed cutter is still listed as a body");
+        const st = JSON.parse(content(await rpc("get_document_state", {})));
+        const drill = st.nodes.find((n) => n.id === "b:drill");
+        if (!drill)
+            return log.fail("the cutter node is gone entirely (it should sit under the body for editing)");
+        if (drill.parentId !== "b:plate")
+            return log.fail(`the cutter is still top-level (parent ${drill.parentId})`);
+        const m = JSON.parse(content(await rpc("esoul.measure", { nodes: ["b:plate"], pairs: [] }))).nodes[0];
+        if (Math.abs(m.volume - (Math.PI * 100 * 3 - Math.PI * 4 * 3)) > 1)
+            return log.fail(`the cut did not happen (volume ${m.volume})`);
+        return log.ok();
+    },
     // D1 — esoul.describe: a plate with three holes and a boss is read back as holes (Ø, centre) + a boss + its planes.
     async D1(log) {
         const r = await replay([

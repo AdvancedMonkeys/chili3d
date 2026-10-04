@@ -39,7 +39,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.29";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.30";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -195,8 +195,12 @@ interface Applied {
     bodies: unknown[];
 }
 
+/** A consumed boolean tool sits under its body (runtime 30) and is not a body of the model. */
+function isConsumedTool(n: INode): boolean {
+    return n.parent !== undefined && "featuresJson" in (n.parent as object);
+}
 function isParametricBody(n: INode): boolean {
-    return "featuresJson" in (n as object);
+    return "featuresJson" in (n as object) && !isConsumedTool(n);
 }
 
 /** The feature lists of every parametric body in the document, as `run_parametric`'s `features` op reports them. */
@@ -233,10 +237,22 @@ function withExtents(doc: IDocument, reported: unknown[]): unknown[] {
 }
 
 /** A node's shape in world space (a copy when the node is transformed) — the caller disposes `owned`. */
+/**
+ * A node's world matrix from the MODEL's own transforms (its local one, then its parents'), never from the
+ * drawn object: a view-only explode (esoul.explode) moves what is drawn, and measure, describe and the
+ * extents in every report must keep answering the model as the fold made it.
+ */
+function nodeWorldTransform(node: INode): Matrix4 | undefined {
+    if (!(node instanceof VisualNode)) return undefined;
+    let m = node.transform;
+    for (let p = node.parent; p !== undefined; p = p.parent)
+        if (p instanceof VisualNode) m = m.multiply(p.transform);
+    return m;
+}
 function worldShape(node: INode): { shape: IShape; owned: boolean } | undefined {
-    const sn = node as { shape?: { isOk: boolean; value: IShape }; worldTransform?: () => Matrix4 };
-    if (!sn.shape?.isOk || typeof sn.worldTransform !== "function") return undefined;
-    const m = sn.worldTransform();
+    const sn = node as { shape?: { isOk: boolean; value: IShape } };
+    const m = nodeWorldTransform(node);
+    if (!sn.shape?.isOk || !m) return undefined;
     if (m.equals(Matrix4.identity())) return { shape: sn.shape.value, owned: false };
     return { shape: sn.shape.value.transformedMul(m), owned: true };
 }
@@ -259,6 +275,31 @@ function worldExtents(node: INode): { bbox: unknown; volume: number } | undefine
     } finally {
         disposeOwned(w);
     }
+}
+
+/**
+ * A VIEW-ONLY explode (runtime 30): each part's DRAWN body moves along world z by factor × k while the
+ * model itself stays where the fold put it — measure, describe and export keep answering the real
+ * geometry. A film slides the parts apart smoothly by calling this per frame; a replay per factor would
+ * rebuild everything (a document-variable change does not re-drive a transform op, which is evaluated once).
+ */
+function explodeView(args: { factor?: number; parts?: { node: string; k?: number }[] }): string {
+    const doc = activeDocument();
+    const factor = Number(args.factor ?? 0);
+    if (!Number.isFinite(factor)) throw new Error("factor must be a number");
+    const moved: { node: string; dz: number }[] = [];
+    for (const p of args.parts ?? []) {
+        const n = doc.modelManager.findNodes((x) => x.id === p.node)[0];
+        if (!n) throw new Error(`no node "${p.node}" in the document`);
+        if (!(n instanceof VisualNode)) throw new Error(`"${p.node}" is not a drawn body`);
+        const visual = doc.visual.context.getVisual(n);
+        if (!visual) continue;
+        const dz = r3(factor * Number(p.k ?? 1));
+        visual.transform = n.transform.multiply(Matrix4.fromTranslation(0, 0, dz));
+        moved.push({ node: p.node, dz });
+    }
+    app?.activeView?.update();
+    return JSON.stringify({ factor, moved });
 }
 
 /** Read-only measurement: never creates, consumes or moves a node (run_program's boolean methods do all three). */
@@ -625,11 +666,18 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
                     bodies?: unknown[];
                 };
                 if (parsed.error) throw new Error(parsed.error);
+                // The bodies a step touched, less the boolean tools it consumed (they sit under their body now).
+                const doc = activeDocument();
+                const bodies = (parsed.bodies ?? []).filter((b) => {
+                    const id = (b as { nodeId?: string }).nodeId;
+                    const n = id ? doc.modelManager.findNodes((x) => x.id === id)[0] : undefined;
+                    return n === undefined || !isConsumedTool(n);
+                });
                 applied.push({
                     stepId: step.id,
                     ok: true,
                     created: parsed.created ?? [],
-                    bodies: withExtents(activeDocument(), parsed.bodies ?? []),
+                    bodies: withExtents(doc, bodies),
                 });
             } catch (err) {
                 applied.push({
@@ -785,6 +833,8 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             return describe(args as { nodes?: string[]; maxFaces?: number });
         case "esoul.measure":
             return measure(args as { nodes?: string[]; pairs?: [string, string][] });
+        case "esoul.explode":
+            return explodeView(args as { factor?: number; parts?: { node: string; k?: number }[] });
         default:
             if (method === "capture_screenshot" || method === "fit_content" || method === "rotate_view")
                 settleView();
