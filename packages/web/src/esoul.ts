@@ -33,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.24";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.25";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -379,7 +379,23 @@ async function finish(applied: Applied[]): Promise<ToolResult> {
     return { content: JSON.stringify({ applied, runtimeVersion: RUNTIME_VERSION }), images };
 }
 
-async function exportModel(args: { format?: string; ids?: string[] }): Promise<ToolResult> {
+/** A file name a workspace accepts: the caller's `name`, else the one exported body's own name, else "model". */
+function exportFileName(name: unknown, nodes: VisualNode[], ext: string): string {
+    const raw =
+        typeof name === "string" && name.trim() ? name.trim() : nodes.length === 1 ? nodes[0].name : "model";
+    const printable = Array.from(raw)
+        .map((ch) => (ch.charCodeAt(0) < 32 ? " " : ch))
+        .join("");
+    const safe =
+        printable
+            .replace(/[\\/:*?"<>|]+/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 80) || "model";
+    return safe.toLowerCase().endsWith(ext) ? safe : `${safe}${ext}`;
+}
+
+async function exportModel(args: { format?: string; ids?: string[]; name?: string }): Promise<ToolResult> {
     if (!app) throw new Error("not booted");
     const doc = activeDocument();
     const format = String(args.format ?? "");
@@ -408,7 +424,12 @@ async function exportModel(args: { format?: string; ids?: string[] }): Promise<T
         bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
     const ext = format.replace(" binary", "");
     return {
-        content: JSON.stringify({ format, fileName: `model${ext}`, bytes: bytes.length, base64: btoa(bin) }),
+        content: JSON.stringify({
+            format,
+            fileName: exportFileName(args.name, nodes, ext),
+            bytes: bytes.length,
+            base64: btoa(bin),
+        }),
     };
 }
 
