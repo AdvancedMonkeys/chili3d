@@ -33,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.27";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.28";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -455,7 +455,6 @@ function exportFileName(name: unknown, nodes: VisualNode[], ext: string): string
 const EXPORT_STASH = new Map<string, { bytes: Uint8Array; fileName: string; format: string }>();
 let lastExportHandle: string | null = null;
 const EXPORT_CHUNK = 2_000_000; // raw bytes per chunk: 2.67 MB as base64, well under the bridge's 4 MB reply cap
-const CHUNK_FROM = 2_500_000; // a base64 body longer than this is handed out in chunks instead
 
 function exportChunk(args: { handle?: string; offset?: number; length?: number }): string {
     const handle = args.handle === "last" ? lastExportHandle : args.handle;
@@ -508,7 +507,8 @@ async function exportModel(args: {
     const bytes = new Uint8Array(await new Blob(parts).arrayBuffer());
     const ext = format.replace(" binary", "");
     const fileName = exportFileName(args.name, nodes, ext);
-    if (args.chunked === true || (bytes.length * 4) / 3 > CHUNK_FROM) {
+    // Chunks only when asked: a tab takes any size in one reply (postMessage has no cap); the server bridge asks.
+    if (args.chunked === true) {
         const handle = `x${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
         EXPORT_STASH.set(handle, { bytes, fileName, format });
         lastExportHandle = handle;
