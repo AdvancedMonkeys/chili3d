@@ -40,7 +40,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.32";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.33";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -592,6 +592,14 @@ function bytesToBase64(bytes: Uint8Array): string {
     return btoa(bin);
 }
 
+const isGzip = (b: Uint8Array) => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b;
+async function gunzip(b: Uint8Array): Promise<Uint8Array> {
+    const inflated = new Blob([b as unknown as BlobPart])
+        .stream()
+        .pipeThrough(new DecompressionStream("gzip"));
+    return new Uint8Array(await new Response(inflated).arrayBuffer());
+}
+
 /** Big inputs come by URL: the page fetches them itself, so no bridge message has to carry their bytes
  *  (an edit snapshot's `url` becomes its `serialized` text; an import op's `url` becomes its `base64`). */
 async function resolveStepUrls(steps: ReplayStep[]): Promise<void> {
@@ -599,7 +607,10 @@ async function resolveStepUrls(steps: ReplayStep[]): Promise<void> {
     const fetchBytes = async (url: string): Promise<Uint8Array> => {
         const r = await fetch(url);
         if (!r.ok) throw new Error(`fetching ${url.slice(0, 96)}: HTTP ${r.status}`);
-        return new Uint8Array(await r.arrayBuffer());
+        const b = new Uint8Array(await r.arrayBuffer());
+        // A gzipped file (the app's geometry cache: 22 MB of BRep text travels as 5) is inflated here, whatever the
+        // server called it — the magic bytes decide, not the name or a header.
+        return isGzip(b) ? gunzip(b) : b;
     };
     for (const step of steps) {
         if (step.kind === "edit") {
@@ -785,30 +796,44 @@ function exportChunk(args: { handle?: string; offset?: number; length?: number }
  * the model without rebuilding it". Big snapshots leave in chunks on request, through the export stash
  * (`esoul.exportChunk`), like an export.
  */
-function snapshot(args: { shapes?: boolean; chunked?: boolean; chunkBytes?: number }): string {
+async function gzip(b: Uint8Array): Promise<Uint8Array> {
+    const deflated = new Blob([b as unknown as BlobPart]).stream().pipeThrough(new CompressionStream("gzip"));
+    return new Uint8Array(await new Response(deflated).arrayBuffer());
+}
+
+/** The document as it stands: plain, or with every built shape (`shapes`), gzipped at the source (`gzip` — the app's
+ *  geometry cache: 22 MB of BRep text leaves as 5, in a quarter of the chunks), inline or chunked through the stash. */
+async function snapshot(args: {
+    shapes?: boolean;
+    gzip?: boolean;
+    chunked?: boolean;
+    chunkBytes?: number;
+}): Promise<string> {
     const doc = activeDocument();
     const serialized = args.shapes
         ? withShapeCache(() => JSON.stringify(doc.serialize()))
         : JSON.stringify(doc.serialize());
-    const bytes = new TextEncoder().encode(serialized);
+    const text = new TextEncoder().encode(serialized);
+    const bytes = args.gzip ? await gzip(text) : text;
     const chunk = Math.max(
         65_536,
         Math.min(EXPORT_CHUNK, Math.floor(Number(args.chunkBytes ?? EXPORT_CHUNK))),
     );
+    const meta = { shapes: !!args.shapes, gzip: !!args.gzip, bytes: bytes.length };
     if (!args.chunked || bytes.length <= chunk) {
-        return JSON.stringify({ shapes: !!args.shapes, bytes: bytes.length, serialized });
+        return JSON.stringify(
+            args.gzip ? { ...meta, base64: bytesToBase64(bytes) } : { ...meta, serialized },
+        );
     }
     const handle = `snapshot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    EXPORT_STASH.set(handle, { bytes, fileName: "snapshot.json", format: ".json" });
+    EXPORT_STASH.set(handle, {
+        bytes,
+        fileName: args.gzip ? "snapshot.json.gz" : "snapshot.json",
+        format: args.gzip ? ".gz" : ".json",
+    });
     lastExportHandle = handle;
     while (EXPORT_STASH.size > 8) EXPORT_STASH.delete(EXPORT_STASH.keys().next().value as string);
-    return JSON.stringify({
-        shapes: !!args.shapes,
-        bytes: bytes.length,
-        chunked: true,
-        handle,
-        chunkBytes: chunk,
-    });
+    return JSON.stringify({ ...meta, chunked: true, handle, chunkBytes: chunk });
 }
 
 async function exportModel(args: {

@@ -5,6 +5,7 @@
 // reaches a user's tab. Written as plain node: no test framework, every test prints what it measured.
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { OUT, openRuntime } from "./lib.mjs";
 import { capsule, cylX, cylZ, dome, fuse, sphere } from "./prims.mjs";
 
@@ -1306,6 +1307,38 @@ const tests = {
             bytes.length !== big.bytes
         )
             return log.fail(`chunks stitched to ${bytes.length} of ${big.bytes} bytes`);
+        return log.ok();
+    },
+    // E5 — esoul.snapshot { gzip }: the runtime gzips its own snapshot (the app's geometry cache on the wire: 22 MB of
+    //      BRep text travels as 5); by URL it inflates and loads like the plain one; a URL that answers 404 fails the replay with the status, not a half-built document.
+    async E5(log) {
+        const r = await replay([{ id: "p", ops: box("plate", "Plate", 0, 0, 60, 40, 0, 3) }]);
+        if (r.failed.length) return log.fail(r.failed[0].error);
+        const vol = async () =>
+            JSON.parse(content(await rpc("esoul.measure", { nodes: ["p:plate"], pairs: [] }))).nodes[0]
+                .volume;
+        const v0 = await vol();
+        const full = JSON.parse(content(await rpc("esoul.snapshot", { shapes: true })));
+        const packed = JSON.parse(content(await rpc("esoul.snapshot", { shapes: true, gzip: true })));
+        if (!packed.gzip || typeof packed.base64 !== "string")
+            return log.fail("a gzip snapshot answered no base64");
+        const gz = Buffer.from(packed.base64, "base64");
+        if (gz.length !== packed.bytes || gz[0] !== 0x1f || gz[1] !== 0x8b)
+            return log.fail(`the gzip snapshot is not gzip (${gz.length} B, ${gz[0]} ${gz[1]})`);
+        if (zlib.gunzipSync(gz).toString("utf8") !== full.serialized)
+            return log.fail("the gzip snapshot does not inflate to the plain one");
+        fs.writeFileSync(path.join(OUT, "e5.json.gz"), gz);
+        log.note(`${full.bytes} B with shapes, ${gz.length} B gzipped by the runtime`);
+        const r2 = await replay([{ id: "c", kind: "edit", url: `${ORIGIN}/__out__/e5.json.gz` }]);
+        if (r2.failed.length) return log.fail(`loading the gzipped cache: ${r2.failed[0].error}`);
+        const v1 = await vol();
+        if (Math.abs(v1 - v0) > 1e-6)
+            return log.fail(`the body from the gzipped cache differs: ${v1} vs ${v0}`);
+        const bad = await rpc("esoul.replay", {
+            steps: [{ id: "c", kind: "edit", url: `${ORIGIN}/__out__/missing.json.gz` }],
+        });
+        if (bad.ok || !/HTTP 404/.test(bad.error ?? ""))
+            return log.fail(`a missing cache URL answered ${bad.ok ? "ok" : bad.error}`);
         return log.ok();
     },
     // D1 — esoul.describe: a plate with three holes and a boss is read back as holes (Ø, centre) + a boss + its planes.
