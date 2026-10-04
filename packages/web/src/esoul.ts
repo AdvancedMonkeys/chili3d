@@ -33,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.26";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.27";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -176,7 +176,7 @@ function withDeterministicIds(stepId: string, ops: unknown[]): unknown[] {
 
 type ReplayStep =
     | { id: string; kind: "program"; ops: unknown[] }
-    | { id: string; kind: "edit"; serialized: string };
+    | { id: string; kind: "edit"; serialized?: string; url?: string };
 interface ReplayArgs {
     variables?: { name: string; type: string; expression: string }[];
     steps?: ReplayStep[];
@@ -289,15 +289,71 @@ function measure(args: { nodes?: string[]; pairs?: [string, string][] }): string
 }
 
 /** Rebuild the model from intent, starting at the last snapshot (it contains everything before it). */
+function bytesToBase64(bytes: Uint8Array): string {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000)
+        bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+}
+
+/** Big inputs come by URL: the page fetches them itself, so no bridge message has to carry their bytes
+ *  (an edit snapshot's `url` becomes its `serialized` text; an import op's `url` becomes its `base64`). */
+async function resolveStepUrls(steps: ReplayStep[]): Promise<void> {
+    const jobs: Promise<void>[] = [];
+    const fetchBytes = async (url: string): Promise<Uint8Array> => {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`fetching ${url.slice(0, 96)}: HTTP ${r.status}`);
+        return new Uint8Array(await r.arrayBuffer());
+    };
+    for (const step of steps) {
+        if (step.kind === "edit") {
+            if (step.serialized === undefined && typeof step.url === "string") {
+                const url = step.url;
+                jobs.push(
+                    fetchBytes(url).then((b) => {
+                        step.serialized = new TextDecoder().decode(b);
+                    }),
+                );
+            }
+            continue;
+        }
+        for (const op of step.ops as unknown as {
+            op?: string;
+            base64?: string;
+            brep?: string;
+            url?: string;
+        }[]) {
+            if (
+                op.op !== "import" ||
+                op.base64 !== undefined ||
+                op.brep !== undefined ||
+                typeof op.url !== "string"
+            )
+                continue;
+            const url = op.url;
+            jobs.push(
+                fetchBytes(url).then((b) => {
+                    op.base64 = bytesToBase64(b);
+                    delete op.url;
+                }),
+            );
+        }
+    }
+    await Promise.all(jobs);
+}
+
 async function replay(args: ReplayArgs): Promise<ToolResult> {
     driving++;
     try {
         const steps = args.steps ?? [];
+        await resolveStepUrls(steps);
         const lastEdit = steps.map((s) => s.kind).lastIndexOf("edit");
         const applied: Applied[] = [];
         if (lastEdit >= 0) {
             const edit = steps[lastEdit] as Extract<ReplayStep, { kind: "edit" }>;
             try {
+                if (edit.serialized === undefined)
+                    throw new Error("the edit step carries no snapshot (neither serialized nor url)");
                 const doc = await openSnapshot(edit.serialized);
                 applied.push({ stepId: edit.id, ok: true, created: [], bodies: await describeBodies(doc) });
             } catch (err) {
@@ -395,7 +451,38 @@ function exportFileName(name: unknown, nodes: VisualNode[], ext: string): string
     return safe.toLowerCase().endsWith(ext) ? safe : `${safe}${ext}`;
 }
 
-async function exportModel(args: { format?: string; ids?: string[]; name?: string }): Promise<ToolResult> {
+/** Exports too big for one bridge reply wait here under a handle and leave in chunks (esoul.exportChunk). */
+const EXPORT_STASH = new Map<string, { bytes: Uint8Array; fileName: string; format: string }>();
+let lastExportHandle: string | null = null;
+const EXPORT_CHUNK = 2_000_000; // raw bytes per chunk: 2.67 MB as base64, well under the bridge's 4 MB reply cap
+const CHUNK_FROM = 2_500_000; // a base64 body longer than this is handed out in chunks instead
+
+function exportChunk(args: { handle?: string; offset?: number; length?: number }): string {
+    const handle = args.handle === "last" ? lastExportHandle : args.handle;
+    const e = typeof handle === "string" ? EXPORT_STASH.get(handle) : undefined;
+    if (!e)
+        throw new Error(
+            `unknown export handle ${String(args.handle)}: the runtime has restarted since that export; run it again`,
+        );
+    const offset = Math.max(0, Math.floor(Number(args.offset ?? 0)));
+    const length = Math.max(1, Math.min(Math.floor(Number(args.length ?? EXPORT_CHUNK)), EXPORT_CHUNK));
+    const slice = e.bytes.subarray(offset, Math.min(e.bytes.length, offset + length));
+    return JSON.stringify({
+        handle,
+        offset,
+        length: slice.length,
+        total: e.bytes.length,
+        done: offset + slice.length >= e.bytes.length,
+        base64: bytesToBase64(slice),
+    });
+}
+
+async function exportModel(args: {
+    format?: string;
+    ids?: string[];
+    name?: string;
+    chunked?: boolean;
+}): Promise<ToolResult> {
     if (!app) throw new Error("not booted");
     const doc = activeDocument();
     const format = String(args.format ?? "");
@@ -419,17 +506,26 @@ async function exportModel(args: { format?: string; ids?: string[]; name?: strin
     const parts = await app.dataExchange.export(format, nodes);
     if (!parts) throw new Error("the exporter produced nothing");
     const bytes = new Uint8Array(await new Blob(parts).arrayBuffer());
-    let bin = "";
-    for (let i = 0; i < bytes.length; i += 0x8000)
-        bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
     const ext = format.replace(" binary", "");
+    const fileName = exportFileName(args.name, nodes, ext);
+    if (args.chunked === true || (bytes.length * 4) / 3 > CHUNK_FROM) {
+        const handle = `x${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+        EXPORT_STASH.set(handle, { bytes, fileName, format });
+        lastExportHandle = handle;
+        while (EXPORT_STASH.size > 8) EXPORT_STASH.delete(EXPORT_STASH.keys().next().value as string);
+        return {
+            content: JSON.stringify({
+                format,
+                fileName,
+                bytes: bytes.length,
+                chunked: true,
+                handle,
+                chunkBytes: EXPORT_CHUNK,
+            }),
+        };
+    }
     return {
-        content: JSON.stringify({
-            format,
-            fileName: exportFileName(args.name, nodes, ext),
-            bytes: bytes.length,
-            base64: btoa(bin),
-        }),
+        content: JSON.stringify({ format, fileName, bytes: bytes.length, base64: bytesToBase64(bytes) }),
     };
 }
 
@@ -444,7 +540,9 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
         case "esoul.replay":
             return replay(args as ReplayArgs);
         case "esoul.export":
-            return exportModel(args as { format?: string; ids?: string[] });
+            return exportModel(args as { format?: string; ids?: string[]; name?: string; chunked?: boolean });
+        case "esoul.exportChunk":
+            return exportChunk(args as { handle?: string; offset?: number; length?: number });
         case "esoul.serialize":
             return JSON.stringify(activeDocument().serialize());
         case "esoul.theme":
