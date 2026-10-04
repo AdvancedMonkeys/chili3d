@@ -33,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.19";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.20";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -355,6 +355,7 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
 
 async function finish(applied: Applied[]): Promise<ToolResult> {
     if (app?.activeView?.document) lastKnownNames = topNames(app.activeView.document);
+    settleView();
     try {
         await callTool("fit_content", {});
     } catch (err) {
@@ -425,6 +426,8 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
         case "esoul.measure":
             return measure(args as { nodes?: string[]; pairs?: [string, string][] });
         default:
+            if (method === "capture_screenshot" || method === "fit_content" || method === "rotate_view")
+                settleView();
             return callTool(method, args);
     }
 }
@@ -605,9 +608,29 @@ function tidyChrome() {
  * The status bar in a narrow frame: chili lets the hint wrap under the snap toggles (two lines
  * fighting for one row). One line each: the hint ends in an ellipsis, the snap row scrolls.
  */
-function tidyStatusBar() {
-    const bar = document.querySelector("chili-statusbar") ?? document.querySelector('[class*="statusbar"]');
-    if (!(bar instanceof HTMLElement)) return;
+/**
+ * Size the view to its element NOW. The three view resizes through a DEBOUNCED ResizeObserver, so a
+ * capture right after a fast boot or replay saw the 300×150 default canvas (every server view came
+ * back as a thumbnail); the explicit resize + update makes the next capture the real viewport.
+ */
+function settleView(): void {
+    const view = app?.activeView;
+    const el = view?.dom;
+    if (!view || !el) return;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    if (w > 0 && h > 0) view.resize(w, h);
+    view.update();
+}
+
+function tidyStatusBar(attempt = 0): void {
+    // ONLY the status bar element itself: a loose "[class*=statusbar]" fallback once matched the main
+    // layout and collapsed the 3D view to a 300×150 canvas (every server view came back as a thumbnail).
+    const bar = document.querySelector("chili-statusbar");
+    if (!(bar instanceof HTMLElement)) {
+        if (attempt < 40) setTimeout(() => tidyStatusBar(attempt + 1), 250);
+        return;
+    }
     const [left, right] = Array.from(bar.children) as HTMLElement[];
     Object.assign(bar.style, { minWidth: "0", overflow: "hidden", gap: "8px", alignItems: "center" });
     if (left) {
