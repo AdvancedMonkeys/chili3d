@@ -33,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.23";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.24";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -743,6 +743,12 @@ function phoneLayout(attempt = 0): void {
         phoneUi.observer.observe(root);
     }
     const narrow = root.clientWidth > 0 && root.clientWidth < NARROW_PX;
+    // The ribbon's title row (app icon, quick commands, the empty tab centre) is 40 px a phone cannot spare.
+    const ribbonTitle = root.children[0]?.children[0];
+    if (ribbonTitle instanceof HTMLElement) {
+        if (narrow) ribbonTitle.style.display = "none";
+        else ribbonTitle.style.removeProperty("display");
+    }
     // chili's narrow stylesheet hides the Items tree (chili-project-view) and keeps the sidebar's edge resizer:
     // inside the drawer the tree is the point, and there is no edge to drag.
     const tree = sidebar.querySelector("chili-project-view") as HTMLElement | null;
