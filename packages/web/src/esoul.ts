@@ -39,7 +39,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.30";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.31";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -275,6 +275,29 @@ function worldExtents(node: INode): { bbox: unknown; volume: number } | undefine
     } finally {
         disposeOwned(w);
     }
+}
+
+/**
+ * The camera, driven from outside (runtime 31): `rotate` orbits by a mouse-like (dx, dy) in pixels — one render per
+ * call, so a film orbits smoothly with a few dozen calls where a drag would send hundreds of pointer events, each
+ * a render; `lookAt` sets eye/target/up outright. Answers where the camera is now.
+ */
+function camera(args: {
+    rotate?: { dx: number; dy: number };
+    lookAt?: { eye: XYZ; target: XYZ; up?: XYZ };
+}): string {
+    const view = app?.activeView;
+    if (!view) throw new Error("no active view");
+    const cc = view.cameraController;
+    if (args.rotate) cc.rotate(Number(args.rotate.dx ?? 0), Number(args.rotate.dy ?? 0));
+    if (args.lookAt) cc.lookAt(args.lookAt.eye, args.lookAt.target, args.lookAt.up ?? { x: 0, y: 0, z: 1 });
+    view.update();
+    const p = cc.cameraPosition;
+    const t = cc.cameraTarget;
+    return JSON.stringify({
+        position: { x: r3(p.x), y: r3(p.y), z: r3(p.z) },
+        target: { x: r3(t.x), y: r3(t.y), z: r3(t.z) },
+    });
 }
 
 /**
@@ -835,6 +858,10 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             return measure(args as { nodes?: string[]; pairs?: [string, string][] });
         case "esoul.explode":
             return explodeView(args as { factor?: number; parts?: { node: string; k?: number }[] });
+        case "esoul.camera":
+            return camera(
+                args as { rotate?: { dx: number; dy: number }; lookAt?: { eye: XYZ; target: XYZ; up?: XYZ } },
+            );
         default:
             if (method === "capture_screenshot" || method === "fit_content" || method === "rotate_view")
                 settleView();

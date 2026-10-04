@@ -1177,6 +1177,46 @@ const tests = {
             return log.fail(`the cut did not happen (volume ${m.volume})`);
         return log.ok();
     },
+    // E3 — esoul.camera: a rotate moves the camera and answers where it is; a lookAt puts it where it was told.
+    async E3(log) {
+        const r = await replay([
+            {
+                id: "c",
+                ops: [
+                    {
+                        op: "sketch",
+                        id: "s",
+                        plane: "XY",
+                        entities: [{ type: "circle", params: [0, 0, 10] }],
+                    },
+                    { op: "extrude", id: "plate", sketch: "s", name: "Plate", depth: 3 },
+                ],
+            },
+        ]);
+        if (r.failed.length) return log.fail(r.failed[0].error);
+        await rpc("fit_content", {});
+        const a = JSON.parse(content(await rpc("esoul.camera", {})));
+        const b = JSON.parse(content(await rpc("esoul.camera", { rotate: { dx: 120, dy: 0 } })));
+        log.note(`before ${JSON.stringify(a.position)} after ${JSON.stringify(b.position)}`);
+        if (
+            Math.hypot(
+                a.position.x - b.position.x,
+                a.position.y - b.position.y,
+                a.position.z - b.position.z,
+            ) < 1
+        )
+            return log.fail("rotate did not move the camera");
+        const c = JSON.parse(
+            content(
+                await rpc("esoul.camera", {
+                    lookAt: { eye: { x: 0, y: -200, z: 50 }, target: { x: 0, y: 0, z: 0 } },
+                }),
+            ),
+        );
+        if (Math.abs(c.position.y + 200) > 1 || Math.abs(c.target.x) > 1)
+            return log.fail(`lookAt landed at ${JSON.stringify(c)}`);
+        return log.ok();
+    },
     // D1 — esoul.describe: a plate with three holes and a boss is read back as holes (Ø, centre) + a boss + its planes.
     async D1(log) {
         const r = await replay([
