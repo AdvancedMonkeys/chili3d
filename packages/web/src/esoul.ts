@@ -33,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.17";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.18";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -142,13 +142,18 @@ function withDeterministicIds(stepId: string, ops: unknown[]): unknown[] {
             opacity?: number;
         };
         if (!op || typeof op !== "object" || !op.id) return [raw];
-        const creates = op.op === "sketch" || op.op === "revolve" || (op.op === "extrude" && !op.body);
+        const creates =
+            op.op === "sketch" ||
+            op.op === "revolve" ||
+            op.op === "import" ||
+            (op.op === "extrude" && !op.body);
         const makesFeature =
             op.op === "extrude" ||
             op.op === "revolve" ||
             op.op === "fillet" ||
             op.op === "chamfer" ||
-            op.op === "boolean";
+            op.op === "boolean" ||
+            op.op === "import";
         const withFeature =
             makesFeature && !(op as { featureId?: string }).featureId
                 ? { featureId: `${stepId}:${op.id}` }

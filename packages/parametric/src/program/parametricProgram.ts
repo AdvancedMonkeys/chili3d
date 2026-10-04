@@ -9,6 +9,7 @@ import {
     type IEdge,
     type IFace,
     type INode,
+    type IShape,
     LENGTH_UNITS,
     Material,
     Matrix4,
@@ -63,6 +64,7 @@ export type ParametricOp =
     | EditFeatureOp
     | TransformOp
     | StyleOp
+    | ImportOp
     | FeaturesOp;
 
 export interface SketchOp {
@@ -176,6 +178,25 @@ export interface TransformOp {
         angle: number;
         origin?: { x: number; y: number; z: number };
     };
+}
+
+/**
+ * Bring a CAD file in as a body (one per solid in the file): STEP or IGES bytes (base64), or BRep
+ * text. The body starts from a `base` feature holding the geometry, so everything a built body
+ * takes — cuts, fuses, fillets, a sketch on one of its faces, a transform — applies to it.
+ */
+export interface ImportOp {
+    op: "import";
+    id: string;
+    nodeId?: string;
+    featureId?: string;
+    name?: string;
+    format: ".step" | ".iges" | ".brep";
+    /** The file's bytes, base64 (STEP/IGES), or for ".brep" the text itself in `brep`. */
+    base64?: string;
+    brep?: string;
+    color?: string;
+    opacity?: number;
 }
 
 /** Colour a node (a body, an imported shape): a material with that colour is found or made in the document. */
@@ -295,6 +316,9 @@ function runOp(state: State, op: ParametricOp): void {
             break;
         case "style":
             runStyleOp(state, op);
+            break;
+        case "import":
+            runImportOp(state, op);
             break;
         case "editFeature":
             runEditFeatureOp(state, op);
@@ -702,6 +726,71 @@ function runStyleOp(state: State, op: StyleOp): void {
     const node = resolveNode(state, op.node, "style target");
     applyStyle(state, node, op.color, op.opacity);
     state.refs.set(op.id, node.id);
+}
+
+function bytesOfBase64(text: string): Uint8Array {
+    const bin = atob(text.replace(/\s+/g, ""));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+function runImportOp(state: State, op: ImportOp): void {
+    const shapes: { shape: IShape; name?: string }[] = [];
+    if (op.format === ".brep" || op.brep !== undefined) {
+        const text = op.brep ?? (op.base64 ? new TextDecoder().decode(bytesOfBase64(op.base64)) : "");
+        if (!text) throw new Error("import: a .brep needs `brep` text (or base64 of it)");
+        const r = shapeConverter.convertFromBrep(text);
+        if (!r.isOk) throw new Error(`import: the BRep could not be read: ${r.error}`);
+        shapes.push({ shape: r.value });
+    } else {
+        if (!op.base64) throw new Error(`import: ${op.format} needs the file's bytes in \`base64\``);
+        const bytes = bytesOfBase64(op.base64);
+        const r =
+            op.format === ".iges"
+                ? shapeConverter.convertFromIGES(state.document, bytes)
+                : shapeConverter.convertFromSTEP(state.document, bytes);
+        if (!r.isOk) throw new Error(`import: the ${op.format} file could not be read: ${r.error}`);
+        const folder = r.value;
+        const walk = (n: INode | undefined): void => {
+            for (let c = n; c !== undefined; c = c.nextSibling) {
+                const sn = c as {
+                    shape?: { isOk: boolean; value: IShape };
+                    firstChild?: INode;
+                    name?: string;
+                };
+                if (sn.shape?.isOk) shapes.push({ shape: sn.shape.value, name: sn.name });
+                else if (sn.firstChild) walk(sn.firstChild);
+            }
+        };
+        walk(folder.firstChild);
+        if (shapes.length === 0) throw new Error(`import: no solid found in the ${op.format} file`);
+    }
+    const base = op.name ?? "Import";
+    shapes.forEach((entry, i) => {
+        const brep = shapeConverter.convertToBrep(entry.shape);
+        if (!brep.isOk) throw new Error(`import: part ${i + 1} could not be kept as BRep: ${brep.error}`);
+        const id = i === 0 ? op.id : `${op.id}:${i + 1}`;
+        const nodeId = op.nodeId === undefined ? undefined : i === 0 ? op.nodeId : `${op.nodeId}:${i + 1}`;
+        const featureId =
+            op.featureId === undefined ? Id.generate() : i === 0 ? op.featureId : `${op.featureId}:${i + 1}`;
+        const name =
+            shapes.length === 1
+                ? base
+                : entry.name && entry.name !== "undefined"
+                  ? entry.name
+                  : `${base} ${i + 1}`;
+        createBody(
+            state,
+            id,
+            name,
+            [{ id: featureId, type: "base", brep: brep.value, source: { format: op.format } }],
+            undefined,
+            nodeId,
+        );
+        if (op.color !== undefined)
+            applyStyle(state, resolveNode(state, id, "imported body"), op.color, op.opacity);
+    });
 }
 
 function runFeaturesOp(state: State, op: FeaturesOp): void {

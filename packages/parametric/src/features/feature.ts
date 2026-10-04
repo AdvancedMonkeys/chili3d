@@ -35,7 +35,19 @@ export type FeatureData =
     | RevolveFeatureData
     | FilletFeatureData
     | ChamferFeatureData
-    | BooleanFeatureData;
+    | BooleanFeatureData
+    | BaseFeatureData;
+
+/**
+ * A body that starts from geometry the kernel did not build here — a STEP/IGES/BREP import,
+ * a captured shape — kept as BRep text the kernel reads back on every rebuild. Later features
+ * (cuts, fuses, fillets, sketches on its faces) treat it like any other body.
+ */
+export interface BaseFeatureData extends FeatureBase {
+    readonly type: "base";
+    readonly brep: string;
+    readonly source?: { readonly format?: string; readonly fileName?: string };
+}
 
 export interface ExtrudeFeatureData extends FeatureBase {
     readonly type: "extrude";
