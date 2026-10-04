@@ -35,7 +35,7 @@ const OPS_SCHEMA = {
         name: { type: "string", description: "Optional display name for the resulting node" },
         plane: {
             description:
-                'Sketch plane: "XY" (default), "YZ", "ZX", or { nodeId, faceIndex } to sketch on a planar face of an existing node',
+                'Sketch plane: "XY" (default), "YZ", "ZX", { base: "XY"|"YZ"|"ZX", offset } for that datum plane moved along its normal (the plane y = 32 is { base: "ZX", offset: 32 }), or { nodeId, faceIndex } to sketch on a planar face of an existing node',
         },
         entities: {
             type: "array",

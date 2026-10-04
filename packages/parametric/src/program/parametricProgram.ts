@@ -66,8 +66,16 @@ export interface SketchOp {
     /** The node id to mint (ExternalSoul passes a deterministic one so a replay on another device yields the same ids). */
     nodeId?: string;
     name?: string;
-    /** A datum plane, or a planar face of an existing node. Defaults to XY. */
-    plane?: "XY" | "YZ" | "ZX" | { nodeId: string; faceIndex: number };
+    /**
+     * A datum plane, a datum plane moved along its normal (`{ base: "ZX", offset: 32 }` is the
+     * plane y = 32 with ZX's u/v), or a planar face of an existing node. Defaults to XY.
+     */
+    plane?:
+        | "XY"
+        | "YZ"
+        | "ZX"
+        | { base: "XY" | "YZ" | "ZX"; offset: number }
+        | { nodeId: string; faceIndex: number };
     entities: { type: SketchEntityType; params: number[] }[];
     constraints?: {
         kind: string;
@@ -308,6 +316,20 @@ function resolveSketchPlane(
     if (picked === undefined || picked === "XY") return { plane: Plane.XY };
     if (picked === "YZ") return { plane: Plane.YZ };
     if (picked === "ZX") return { plane: Plane.ZX };
+    if ("base" in picked) {
+        // An offset datum plane: the base plane carried along its own normal, u/v unchanged.
+        const base = picked.base === "YZ" ? Plane.YZ : picked.base === "ZX" ? Plane.ZX : Plane.XY;
+        const offset = Number(picked.offset);
+        if (!Number.isFinite(offset))
+            throw new Error(`plane offset must be a finite number (got ${String(picked.offset)})`);
+        return {
+            plane: new Plane({
+                origin: base.origin.add(base.normal.multiply(offset)),
+                normal: base.normal,
+                xvec: base.xvec,
+            }),
+        };
+    }
 
     const host = resolveNode(state, picked.nodeId, "plane host");
     if (!(host instanceof ShapeNode) || !host.shape.isOk) {
