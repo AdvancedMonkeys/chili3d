@@ -33,6 +33,8 @@ const OPS_SCHEMA = {
                 "boolean",
                 "editFeature",
                 "transform",
+                "style",
+                "import",
                 "features",
             ],
             description: "Which operation to run",

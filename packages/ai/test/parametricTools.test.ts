@@ -36,6 +36,9 @@ describe("parametricTools", () => {
             "chamfer",
             "boolean",
             "editFeature",
+            "transform",
+            "style",
+            "import",
             "features",
         ]);
         expect(opsSchema().required).toEqual(["op"]);
