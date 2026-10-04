@@ -18,6 +18,7 @@ import { AppBuilder } from "@chili3d/builder";
 import {
     Config,
     History,
+    I18n,
     type IApplication,
     type IDocument,
     type IHistoryRecord,
@@ -30,7 +31,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.14";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.15";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -245,6 +246,7 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
 }
 
 async function finish(applied: Applied[]): Promise<ToolResult> {
+    if (app?.activeView?.document) lastKnownNames = topNames(app.activeView.document);
     try {
         await callTool("fit_content", {});
     } catch (err) {
@@ -365,20 +367,59 @@ function summarize(doc: IDocument): string {
     return `${top.length} top-level node${top.length === 1 ? "" : "s"}: ${names.join(", ")}${top.length > 12 ? ", …" : ""}`;
 }
 
+/** Top-level node names, for describing what a gesture changed. */
+function topNames(doc: IDocument): string[] {
+    return doc.modelManager.findNodes((n) => n.parent === doc.modelManager.rootNode).map((n) => n.name);
+}
+/** The top-level names as of the last capture or replay — the "before" of the next gesture. */
+let lastKnownNames: string[] = [];
+let namesBeforeEdit: string[] | undefined;
+
+/** A record's name as a person would say it: chili's commands name their transactions
+ *  `excute <i18n key>` (sometimes with no key at all), so translate the key, or describe the
+ *  change by the nodes it added or removed. */
+function describeLabels(labels: string[], before: string[] | undefined, after: string[]): string {
+    const spoken = Array.from(new Set(labels))
+        .map((l) => l.replace(/^excute\s*/i, "").trim())
+        .filter((l) => l && l !== "undefined")
+        .map((l) => {
+            if (!l.includes(".")) return l;
+            try {
+                const t = I18n.translate(l as never);
+                return typeof t === "string" && t && t !== l ? t : (l.split(".").pop() ?? l);
+            } catch {
+                return l.split(".").pop() ?? l;
+            }
+        });
+    if (spoken.length > 0) return spoken.join(", ");
+    const was = new Set(before ?? []);
+    const now = new Set(after);
+    const added = after.filter((n) => !was.has(n));
+    const removed = (before ?? []).filter((n) => !now.has(n));
+    if (added.length && !removed.length) return `added ${added.join(", ")}`;
+    if (removed.length && !added.length) return `deleted ${removed.join(", ")}`;
+    if (added.length || removed.length) return `replaced ${removed.join(", ")} with ${added.join(", ")}`;
+    return "edited";
+}
+
 function flushEdit() {
     editTimer = undefined;
     const labels = editLabels;
     editLabels = [];
+    const before = namesBeforeEdit;
+    namesBeforeEdit = undefined;
     if (!app?.activeView?.document || labels.length === 0) return;
     const doc = app.activeView.document;
     try {
         const serialized = JSON.stringify(doc.serialize());
+        const after = topNames(doc);
         post({
             type: "edit",
-            label: Array.from(new Set(labels)).join(", "),
+            label: describeLabels(labels, before, after),
             summary: summarize(doc),
             serialized,
         });
+        lastKnownNames = after;
     } catch (err) {
         Logger.error(`esoul edit capture failed: ${(err as Error).message}`);
     }
@@ -391,6 +432,7 @@ History.prototype.add = function esoulCapturingAdd(this: History, record: IHisto
     if (driving > 0 || !parentOrigin) return;
     if (this.isUndoing || this.isRedoing) return;
     editLabels.push(String((record as { name?: string }).name ?? "edit"));
+    if (namesBeforeEdit === undefined) namesBeforeEdit = lastKnownNames;
     if (editTimer) clearTimeout(editTimer);
     editTimer = setTimeout(flushEdit, EDIT_DEBOUNCE_MS);
 };
