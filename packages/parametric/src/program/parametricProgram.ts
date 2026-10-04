@@ -3,6 +3,7 @@
 
 import {
     ANGLE_UNITS,
+    evaluateExpression,
     type FeatureItem,
     type IDocument,
     Id,
@@ -83,7 +84,13 @@ export interface SketchOp {
         | "ZX"
         | { base: "XY" | "YZ" | "ZX"; offset: number }
         | { nodeId: string; faceIndex: number };
-    entities: { type: SketchEntityType; params: number[] }[];
+    /**
+     * Entities in sketch (u,v). A param may be a NUMBER or an EXPRESSION naming document variables
+     * ("unit * 2"). Two macros expand before solving: `grid` [x0, y0, w, h, nx, ny, pitchX, pitchY] —
+     * nx × ny rectangles of w × h whose first lower-left corner is (x0, y0); `circles` [x0, y0, r, nx,
+     * ny, pitchX, pitchY] — a grid of circles centred from (x0, y0).
+     */
+    entities: { type: SketchEntityType | "grid" | "circles"; params: (number | string)[] }[];
     constraints?: {
         kind: string;
         refs: { entity: number; point: number }[];
@@ -130,6 +137,31 @@ export interface RevolveOp {
     angle?: ParameterValue;
 }
 
+/**
+ * Which edges of a body a fillet/chamfer takes, without indexes: every filter must hold. Directions
+ * compare the edge's chord (start→end); straight edges only unless `curved` is true.
+ */
+export interface EdgeSelector {
+    /** The chord is parallel to this axis (within 5°). */
+    parallelTo?: "x" | "y" | "z";
+    /** The chord lies in this plane's normal direction? No — the chord is PERPENDICULAR to this axis. */
+    perpendicularTo?: "x" | "y" | "z";
+    /** Both ends inside this box (world coordinates; any bound may be omitted). */
+    minX?: number;
+    maxX?: number;
+    minY?: number;
+    maxY?: number;
+    minZ?: number;
+    maxZ?: number;
+    /** The edge's midpoint within `within` (default 1) of this point. */
+    near?: { x: number; y: number; z: number };
+    within?: number;
+    longerThan?: number;
+    shorterThan?: number;
+    /** Include curved edges (circles, arcs) — off by default. */
+    curved?: boolean;
+}
+
 export interface FilletChamferOp {
     op: "fillet" | "chamfer";
     id: string;
@@ -138,7 +170,9 @@ export interface FilletChamferOp {
     name?: string;
     body: string;
     /** Indexes into the body's current edge list (findSubShapes order). */
-    edgeIndexes: number[];
+    /** Explicit edge indexes (findSubShapes order), or a selector; one of the two. */
+    edgeIndexes?: number[];
+    edges?: EdgeSelector;
     radius?: ParameterValue;
     distance?: ParameterValue;
 }
@@ -440,8 +474,63 @@ function resolveSketchPlane(
     }
 }
 
+/** A sketch param: a number, or an expression over the document's variables (unit-free numbers and lengths both read as mm). */
+function sketchNumber(value: number | string, scope: Scope, where: string): number {
+    if (typeof value === "number") {
+        if (!Number.isFinite(value)) throw new Error(`${where}: ${value} is not a finite number`);
+        return value;
+    }
+    const r = evaluateExpression(value, scope);
+    if (!r.isOk) throw new Error(`${where}: "${value}" — ${r.error}`);
+    return r.value.value;
+}
+
+/** Expand the `grid`/`circles` macros into plain entities and evaluate every param. */
+function expandSketchEntities(op: SketchOp, scope: Scope): { type: SketchEntityType; params: number[] }[] {
+    const out: { type: SketchEntityType; params: number[] }[] = [];
+    op.entities.forEach((entity, index) => {
+        const where = `sketch "${op.id}" entity ${index} (${entity.type})`;
+        const nums = entity.params.map((p, k) => sketchNumber(p, scope, `${where} param ${k}`));
+        if (entity.type === "grid") {
+            if (nums.length !== 8)
+                throw new Error(`${where}: grid takes [x0, y0, w, h, nx, ny, pitchX, pitchY]`);
+            const [x0, y0, w, h, nx, ny, px, py] = nums;
+            if (nx < 1 || ny < 1 || nx * ny > 2000)
+                throw new Error(`${where}: grid of ${nx}×${ny} is out of range (1..2000 cells)`);
+            for (let j = 0; j < ny; j++)
+                for (let i = 0; i < nx; i++) {
+                    const a = x0 + i * px,
+                        b = y0 + j * py,
+                        c = a + w,
+                        d = b + h;
+                    out.push(
+                        { type: "line", params: [a, b, c, b] },
+                        { type: "line", params: [c, b, c, d] },
+                        { type: "line", params: [c, d, a, d] },
+                        { type: "line", params: [a, d, a, b] },
+                    );
+                }
+            return;
+        }
+        if (entity.type === "circles") {
+            if (nums.length !== 7)
+                throw new Error(`${where}: circles takes [x0, y0, r, nx, ny, pitchX, pitchY]`);
+            const [x0, y0, r, nx, ny, px, py] = nums;
+            if (nx < 1 || ny < 1 || nx * ny > 2000)
+                throw new Error(`${where}: ${nx}×${ny} circles is out of range (1..2000)`);
+            for (let j = 0; j < ny; j++)
+                for (let i = 0; i < nx; i++)
+                    out.push({ type: "circle", params: [x0 + i * px, y0 + j * py, r] });
+            return;
+        }
+        out.push({ type: entity.type, params: nums });
+    });
+    return out;
+}
+
 function buildSketchData(document: IDocument, op: SketchOp, plane: Plane): SketchData {
-    const entities: SketchEntityData[] = op.entities.map((entity, index) => ({
+    const scope = document.variables.evaluate().scope;
+    const entities: SketchEntityData[] = expandSketchEntities(op, scope).map((entity, index) => ({
         id: index + 1,
         type: entity.type,
         params: entity.params,
@@ -568,6 +657,48 @@ function runRevolveOp(state: State, op: RevolveOp): void {
     );
 }
 
+const AXIS: Record<"x" | "y" | "z", XYZ> = { x: new XYZ(1, 0, 0), y: new XYZ(0, 1, 0), z: new XYZ(0, 0, 1) };
+
+/** The indexes of the body's edges an EdgeSelector picks, in world coordinates. */
+function selectEdges(edges: IEdge[], sel: EdgeSelector, host: { worldTransform(): Matrix4 }): number[] {
+    const m = host.worldTransform();
+    const identity = m.equals(Matrix4.identity());
+    const cos5 = Math.cos((5 * Math.PI) / 180);
+    const out: number[] = [];
+    edges.forEach((edge, index) => {
+        const [s0, e0] = edge.ends();
+        const s = identity ? s0 : m.ofPoint(s0),
+            e = identity ? e0 : m.ofPoint(e0);
+        const chord = e.sub(s);
+        const len = edge.length();
+        const straight = Math.abs(len - chord.length()) < 1e-3 * Math.max(1, len);
+        if (!straight && !sel.curved) return;
+        const dir = chord.length() > 1e-9 ? chord.normalize() : undefined;
+        if (sel.parallelTo) {
+            if (!dir || Math.abs(dir.dot(AXIS[sel.parallelTo])) < cos5) return;
+        }
+        if (sel.perpendicularTo) {
+            if (!dir || Math.abs(dir.dot(AXIS[sel.perpendicularTo])) > Math.sin((5 * Math.PI) / 180)) return;
+        }
+        const inside = (p: XYZ) =>
+            (sel.minX === undefined || p.x >= sel.minX - 1e-6) &&
+            (sel.maxX === undefined || p.x <= sel.maxX + 1e-6) &&
+            (sel.minY === undefined || p.y >= sel.minY - 1e-6) &&
+            (sel.maxY === undefined || p.y <= sel.maxY + 1e-6) &&
+            (sel.minZ === undefined || p.z >= sel.minZ - 1e-6) &&
+            (sel.maxZ === undefined || p.z <= sel.maxZ + 1e-6);
+        if (!inside(s) || !inside(e)) return;
+        if (sel.near) {
+            const mid = s.add(e).multiply(0.5);
+            if (mid.distanceTo(new XYZ(sel.near.x, sel.near.y, sel.near.z)) > (sel.within ?? 1)) return;
+        }
+        if (sel.longerThan !== undefined && !(len > sel.longerThan)) return;
+        if (sel.shorterThan !== undefined && !(len < sel.shorterThan)) return;
+        out.push(index);
+    });
+    return out;
+}
+
 function runEdgeCornerOp(state: State, op: FilletChamferOp): void {
     const body = resolveBody(state, op.body);
     const shape = body.shape;
@@ -579,7 +710,14 @@ function runEdgeCornerOp(state: State, op: FilletChamferOp): void {
     ensureUnit(value, scope, LENGTH_UNITS, op.op === "fillet" ? "radius" : "distance");
 
     const edges = shape.value.findSubShapes(ShapeTypes.edge) as IEdge[];
-    const refs = op.edgeIndexes.map((index) => {
+    const indexes = op.edgeIndexes ?? (op.edges ? selectEdges(edges, op.edges, body) : undefined);
+    if (indexes === undefined) throw new Error(`"${op.op}" needs "edgeIndexes" or an "edges" selector`);
+    if (indexes.length === 0)
+        throw new Error(
+            `"${op.op}": the edge selector matched no edge of body "${op.body}" (${edges.length} edges)`,
+        );
+    state.out.results[`${op.id}.edges`] = indexes;
+    const refs = indexes.map((index) => {
         const edge = edges[index];
         if (edge === undefined) {
             throw new Error(
