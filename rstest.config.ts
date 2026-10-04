@@ -6,7 +6,8 @@ import packages from "./package.json" with { type: "json" };
 const configDir = import.meta.dirname;
 
 export default defineConfig({
-    exclude: ["**/cpp/**"],
+    // esoul-tests drive the built runtime in a real Chrome (`npm run test:runtime`, the Pages gate), not a unit test
+    exclude: ["**/cpp/**", "**/esoul-tests/**"],
     coverage: {
         exclude: ["**/wasm/lib/**", "**/test-utils/**"],
     },
