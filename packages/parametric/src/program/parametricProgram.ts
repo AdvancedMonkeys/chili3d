@@ -207,10 +207,11 @@ export interface TransformOp {
     id: string;
     /** The node to move (an op id or a node id); booleans read tools in world space, so a moved tool cuts where it now is. */
     node: string;
-    translate?: { x?: number; y?: number; z?: number };
+    /** Each component a number or an EXPRESSION over the document's variables ("explode * 2") — an exploded view is a variable. */
+    translate?: { x?: number | string; y?: number | string; z?: number | string };
     rotate?: {
         axis: { x: number; y: number; z: number };
-        angle: number;
+        angle: number | string;
         origin?: { x: number; y: number; z: number };
     };
 }
@@ -819,6 +820,9 @@ function runTransformOp(state: State, op: TransformOp): void {
     const node = resolveNode(state, op.node, "transform target");
     if (!(node instanceof VisualNode))
         throw new Error(`"${op.node}" is not a visual node and cannot be moved`);
+    const scope = state.document.variables.evaluate().scope;
+    const num = (v: number | string | undefined, what: string): number =>
+        v === undefined ? 0 : sketchNumber(v, scope, `transform "${op.id}" ${what}`);
     let delta = Matrix4.identity();
     if (op.rotate !== undefined) {
         const a = op.rotate.axis;
@@ -826,12 +830,16 @@ function runTransformOp(state: State, op: TransformOp): void {
         if (axis.length() < 1e-9) throw new Error("rotate.axis must not be zero");
         const o = op.rotate.origin ?? { x: 0, y: 0, z: 0 };
         delta = delta.multiply(
-            Matrix4.fromAxisRad(new XYZ(o.x, o.y, o.z), axis, (op.rotate.angle * Math.PI) / 180),
+            Matrix4.fromAxisRad(
+                new XYZ(o.x, o.y, o.z),
+                axis,
+                (num(op.rotate.angle, "angle") * Math.PI) / 180,
+            ),
         );
     }
     if (op.translate !== undefined) {
         const t = op.translate;
-        delta = delta.multiply(Matrix4.fromTranslation(t.x ?? 0, t.y ?? 0, t.z ?? 0));
+        delta = delta.multiply(Matrix4.fromTranslation(num(t.x, "x"), num(t.y, "y"), num(t.z, "z")));
     }
     node.transform = node.transform.multiply(delta);
     state.refs.set(op.id, node.id);

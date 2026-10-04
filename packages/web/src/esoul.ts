@@ -33,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.22";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.23";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -202,10 +202,18 @@ async function describeBodies(doc: IDocument): Promise<unknown[]> {
     });
     const parsed = JSON.parse(typeof r === "string" ? r : r.content) as {
         bodies?: unknown[];
+        results?: Record<string, unknown>;
         error?: string;
     };
     if (parsed.error) throw new Error(parsed.error);
-    return withExtents(doc, parsed.bodies ?? []);
+    // A `features` op READS a body and so never lists it among the bodies the program touched: the
+    // list is built from the per-body results (esoul.bodies used to answer [] for every document).
+    const reported = bodies.map((b, i) => ({
+        nodeId: b.id,
+        name: b.name,
+        features: (parsed.results?.[`f${i}`] as unknown[] | undefined) ?? [],
+    }));
+    return withExtents(doc, reported);
 }
 
 /** Where each reported body IS (world space) and how big: an agent reads this from the fold, no kernel round trip. */
