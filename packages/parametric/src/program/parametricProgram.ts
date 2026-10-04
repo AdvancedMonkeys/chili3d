@@ -112,7 +112,8 @@ export interface ExtrudeOp {
     name?: string;
     /** The sketch op id, or an existing sketch's node id. */
     sketch: string;
-    depth: ParameterValue;
+    /** A length, an expression, or "through" — a cut all the way through the body (symmetric, re-measured on every rebuild). */
+    depth: ParameterValue | "through";
     symmetric?: boolean;
     startOffset?: ParameterValue;
     /** Omit to create a new body; otherwise the body to append the feature to. */
@@ -592,7 +593,13 @@ function parseConstraintKind(kind: unknown): ConstraintKind {
 function runExtrudeOp(state: State, op: ExtrudeOp): void {
     const sketch = resolveSketch(state, op.sketch);
     const scope = state.document.variables.evaluate().scope;
-    ensureUnit(op.depth, scope, LENGTH_UNITS, "depth");
+    const through = op.depth === "through";
+    if (through) {
+        if (op.body === undefined || (op.operation !== "cut" && op.operation !== "common"))
+            throw new Error(
+                'depth "through" is for a cut (or common) into an existing body: give "body" and "operation"',
+            );
+    } else ensureUnit(op.depth, scope, LENGTH_UNITS, "depth");
     if (op.startOffset !== undefined) ensureUnit(op.startOffset, scope, LENGTH_UNITS, "startOffset");
 
     // `profiles` is deliberately left out: an absent list extrudes every closed profile
@@ -603,7 +610,7 @@ function runExtrudeOp(state: State, op: ExtrudeOp): void {
         type: "extrude",
         sketchId: sketch.id,
         depth: op.depth,
-        ...(op.symmetric === true ? { symmetric: true } : {}),
+        ...(op.symmetric === true || through ? { symmetric: true } : {}),
         ...(op.startOffset !== undefined ? { startOffset: op.startOffset } : {}),
     };
     if (op.body === undefined) {

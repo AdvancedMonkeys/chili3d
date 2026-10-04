@@ -253,7 +253,7 @@ function resolveRefEntry(
     const node = doc.modelManager.findNodes((n) => n.id === id)[0];
     if (node instanceof ShapeNode && node.shape.isOk) {
         consumed.add(node.id);
-        return { nodeId: node.id, kind: "shape", value: node.shape.value };
+        return { nodeId: node.id, kind: "shape", value: worldShapeOf(node) };
     }
     throw new Error(I18n.translate("ai.error.unknownRef", id, summarizeRefIds(localRefs)));
 }
@@ -288,8 +288,19 @@ function refreshNodeValue(id: string, entry: LocalRef, doc: IDocument, consumed:
     }
     consumed.add(node.id);
     if (!entry.parent) {
-        entry.value = node.shape.value;
+        entry.value = worldShapeOf(node);
     }
+}
+
+/**
+ * A node's shape where it IS: a moved node (a non-identity world transform — the esoul `transform`
+ * op) answers queries in world space, like every other reader of the scene. The copy is kept for
+ * the session; the kernel frees it with the document.
+ */
+function worldShapeOf(node: ShapeNode): IShape {
+    const shape = node.shape.value;
+    const m = node.worldTransform();
+    return m.equals(Matrix4.identity()) ? shape : shape.transformedMul(m);
 }
 
 /** The value a derived ref points at: the parent's member, called with the recorded arguments. */

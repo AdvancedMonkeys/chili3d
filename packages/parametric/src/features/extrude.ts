@@ -98,6 +98,16 @@ function resolveExtrudeParams(
     feature: ExtrudeFeatureData,
     context: FeatureContext,
 ): Result<{ depth: number; startOffset: number }> {
+    if (feature.depth === "through") {
+        // A through-all cut: long enough to pass the whole body it is cut from, re-measured on every
+        // rebuild so the hole keeps going through after the body grows. Always symmetric (the sketch
+        // plane may sit anywhere on the body).
+        const input = context.input;
+        if (input === undefined) return Result.err('a "through" extrude needs a body to cut through');
+        const bb = input.boundingBox();
+        const diag = Math.hypot(bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z) || 1;
+        return Result.ok({ depth: 2 * diag + 2, startOffset: 0 });
+    }
     const depth = resolveUnitSpec(feature.depth, context.scope, LENGTH_UNITS);
     if (!depth.isOk) return Result.err(depth.error);
     const startOffset = resolveUnitSpec(feature.startOffset ?? 0, context.scope, LENGTH_UNITS);
