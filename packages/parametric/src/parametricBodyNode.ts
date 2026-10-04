@@ -98,6 +98,31 @@ export interface ParametricBodyNodeOptions {
     id?: string;
 }
 
+/**
+ * ON only around a geometry-cache snapshot (the esoul runtime's `esoul.snapshot { shapes: true }`): every built
+ * body then serialises its finished shape too, so that snapshot loads without re-running a single feature. A hand
+ * edit's snapshot keeps the flag off and stays intent-sized.
+ */
+let serializeShapeCache = false;
+export function withShapeCache<T>(fn: () => T): T {
+    serializeShapeCache = true;
+    try {
+        return fn();
+    } finally {
+        serializeShapeCache = false;
+    }
+}
+
+/** FNV-1a of a body's featuresJson: the identity a cached shape is bound to. */
+function featuresHash(featuresJson: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < featuresJson.length; i++) {
+        h ^= featuresJson.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+}
+
 /** A body whose shape is replayed from its feature list — see the module header above. */
 @serializable()
 export class ParametricBodyNode
@@ -153,6 +178,19 @@ export class ParametricBodyNode
         this.setPropertyEmitShapeChanged("featuresJson", value);
     }
 
+    /**
+     * The shape as built, for a snapshot that must load without re-running the chain: "<hash of featuresJson>\n<BRep>".
+     * Written only while `withShapeCache` is on and the shape is built; honoured on load only while featuresJson still
+     * hashes the same, and only for DISPLAY — the first read of a tracked id, and any feature change, runs the chain
+     * for real (`ensureEvaluated`). Loaded through the serializer's private-value path, never set by hand.
+     */
+    @serialize()
+    get shapeCache(): string | undefined {
+        if (!serializeShapeCache || !this._shape.isOk) return undefined;
+        const brep = shapeConverter.convertToBrep(this._shape.value);
+        return brep.isOk ? `${featuresHash(this.featuresJson)}\n${brep.value}` : undefined;
+    }
+
     get features(): FeatureData[] {
         return JSON.parse(this.featuresJson);
     }
@@ -168,6 +206,8 @@ export class ParametricBodyNode
     private _evaluating = false;
     /** False until the first evaluation; see the `shape` getter. */
     private _evaluated = false;
+    /** True while `_shape` came from a snapshot's cache and the chain has not run in this session. */
+    private _fromCache = false;
     /**
      * Runtime-only session state (never serialized, never transacted): when set,
      * `evaluateChain` replays only the features before this index. The sketch editor
@@ -476,10 +516,37 @@ export class ParametricBodyNode
         // this node as its source) gets the previous result as-is: recomputing here
         // would re-enter generateShape.
         if (this._evaluating) return this._shape;
+        if (!this._shape.isOk && !this._evaluated) {
+            const cached = this.takeShapeCache();
+            if (cached) return cached;
+        }
         if (!this._shape.isOk && (!this._evaluated || this.hasNewReferences())) {
             this._shape = this.generateShape();
         }
         return this._shape;
+    }
+
+    /** A snapshot's cached shape, once, when it still belongs to this featuresJson — else nothing, and the chain runs. */
+    private takeShapeCache(): Result<IShape> | undefined {
+        const raw = this.getPrivateValue("shapeCache");
+        if (typeof raw !== "string") return undefined;
+        this.setPrivateValue("shapeCache", undefined); // one use: a later snapshot of this document never carries it on
+        const nl = raw.indexOf("\n");
+        if (nl < 0 || raw.slice(0, nl) !== featuresHash(this.featuresJson)) return undefined;
+        const r = shapeConverter.convertFromBrep(raw.slice(nl + 1));
+        if (!r.isOk) return undefined;
+        this._evaluated = true;
+        this._fromCache = true;
+        this.syncWatchedNodes(); // a sketch or a reference edited later must still reach this body
+        this._shape = r;
+        return this._shape;
+    }
+
+    /** A cached shape serves display only: before anything reads the chain's tracked ids or states, run it. */
+    private ensureEvaluated(): void {
+        if (!this._fromCache) return;
+        this._fromCache = false;
+        this._shape = this.generateShape();
     }
     override set shape(value: Result<IShape>) {
         this.setShape(value);
@@ -493,6 +560,7 @@ export class ParametricBodyNode
 
     protected generateShape(): Result<IShape> {
         this._evaluated = true;
+        this._fromCache = false;
         this.syncWatchedNodes();
         this._featureErrors.clear();
         this._featureWarnings.clear();
@@ -510,34 +578,42 @@ export class ParametricBodyNode
     // ------------------------------------------------------------------ Tracking facade (IBodyTrackingNode / IBodyTimelineNode)
 
     faceIdAt(index: number): string | undefined {
+        this.ensureEvaluated();
         return this._timeline.idAt(index, "face");
     }
 
     faceIndexById(id: string): number | undefined {
+        this.ensureEvaluated();
         return this._timeline.indexOfId("face", id);
     }
 
     faceIndexesOfId(id: string): number[] {
+        this.ensureEvaluated();
         return this._timeline.indexesOfId("face", id);
     }
 
     edgeIdAt(index: number): string | undefined {
+        this.ensureEvaluated();
         return this._timeline.idAt(index, "edge");
     }
 
     edgeIndexById(id: string): number | undefined {
+        this.ensureEvaluated();
         return this._timeline.indexOfId("edge", id);
     }
 
     edgeIndexesOfId(id: string): number[] {
+        this.ensureEvaluated();
         return this._timeline.indexesOfId("edge", id);
     }
 
     faceIdIsShared(id: string | undefined): boolean {
+        this.ensureEvaluated();
         return this._timeline.idIsShared("face", id);
     }
 
     edgeIdIsShared(id: string | undefined): boolean {
+        this.ensureEvaluated();
         return this._timeline.idIsShared("edge", id);
     }
 
@@ -552,6 +628,7 @@ export class ParametricBodyNode
      * the referenced edge) does not make them dangle. See `BodyTimeline.stateAt`.
      */
     timelineStateAt(index: number): FeatureTimelineState | undefined {
+        this.ensureEvaluated();
         return this._timeline.stateAt(index);
     }
 

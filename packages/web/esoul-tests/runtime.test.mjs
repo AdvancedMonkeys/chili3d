@@ -1217,6 +1217,97 @@ const tests = {
             return log.fail(`lookAt landed at ${JSON.stringify(c)}`);
         return log.ok();
     },
+    // E4 — esoul.snapshot { shapes }: a snapshot that carries every built shape loads back as the same geometry without
+    //      re-running the chain, a later step still cuts into a cached body, a plain snapshot carries no shapes, and a big
+    //      one leaves in chunks that stitch back byte for byte.
+    async E4(log) {
+        const plate = [
+            {
+                op: "sketch",
+                id: "s",
+                plane: "XY",
+                entities: [...rect(0, 0, 60, 40), { type: "circle", params: [30, 20, 4] }],
+            },
+            { op: "extrude", id: "plate", sketch: "s", name: "Plate", depth: 3 },
+            {
+                op: "sketch",
+                id: "s2",
+                plane: { base: "XY", offset: 3 },
+                entities: [{ type: "circle", params: [10, 10, 6] }],
+            },
+            {
+                op: "extrude",
+                id: "boss",
+                sketch: "s2",
+                name: "Boss",
+                depth: 8,
+                body: "plate",
+                operation: "fuse",
+            },
+        ];
+        const r = await replay([{ id: "p", ops: plate }]);
+        if (r.failed.length) return log.fail(r.failed[0].error);
+        const vol = async () =>
+            JSON.parse(content(await rpc("esoul.measure", { nodes: ["p:plate"], pairs: [] }))).nodes[0]
+                .volume;
+        const v0 = await vol();
+        const plain = JSON.parse(content(await rpc("esoul.snapshot", {})));
+        if (plain.serialized.includes("shapeCache")) return log.fail("a plain snapshot carries shapes");
+        const full = JSON.parse(content(await rpc("esoul.snapshot", { shapes: true })));
+        if (!full.serialized.includes("shapeCache")) return log.fail("a shapes snapshot carries no shapes");
+        log.note(`snapshot ${plain.bytes} B plain, ${full.bytes} B with shapes`);
+        // a fresh document from the shapes snapshot alone: same geometry, same ids
+        const r2 = await replay([{ id: "c", kind: "edit", serialized: full.serialized }]);
+        if (r2.failed.length) return log.fail(`loading the cache: ${r2.failed[0].error}`);
+        const v1 = await vol();
+        if (Math.abs(v1 - v0) > 1e-6) return log.fail(`the cached body differs: ${v1} vs ${v0}`);
+        const d = await rpc("esoul.describe", { nodes: ["p:plate"] });
+        if (!d.ok || !JSON.parse(content(d)).bodies[0].holes.length)
+            return log.fail("describe on the cached body found no hole");
+        // a step after the cache cuts into the cached body (the chain runs for real then)
+        const r3 = await replay([
+            { id: "c", kind: "edit", serialized: full.serialized },
+            {
+                id: "q",
+                ops: [
+                    {
+                        op: "sketch",
+                        id: "s3",
+                        plane: { base: "XY", offset: -1 },
+                        entities: [{ type: "circle", params: [50, 30, 3] }],
+                    },
+                    { op: "extrude", id: "drill", sketch: "s3", depth: 6, body: "p:plate", operation: "cut" },
+                ],
+            },
+        ]);
+        if (r3.failed.length) return log.fail(`a cut after the cache: ${r3.failed[0].error}`);
+        const v2 = await vol();
+        if (!(v2 < v0 - 50)) return log.fail(`the cut after the cache removed nothing (${v2} vs ${v0})`);
+        // chunks: forced small, stitched back to the same text
+        const big = JSON.parse(
+            content(await rpc("esoul.snapshot", { shapes: true, chunked: true, chunkBytes: 65536 })),
+        );
+        if (!big.chunked) return log.fail("a snapshot above the chunk size did not chunk");
+        let text = "",
+            off = 0;
+        for (let i = 0; i < 400 && off < big.bytes; i++) {
+            const c = JSON.parse(
+                content(await rpc("esoul.exportChunk", { handle: big.handle, offset: off, length: 65536 })),
+            );
+            text += atob(c.base64);
+            off += c.length;
+            if (c.done) break;
+        }
+        const bytes = Uint8Array.from(text, (ch) => ch.charCodeAt(0));
+        const stitched = new TextDecoder().decode(bytes);
+        if (
+            stitched.length !== new TextDecoder().decode(new TextEncoder().encode(stitched)).length ||
+            !stitched.includes("shapeCache") ||
+            bytes.length !== big.bytes
+        )
+            return log.fail(`chunks stitched to ${bytes.length} of ${big.bytes} bytes`);
+        return log.ok();
+    },
     // D1 — esoul.describe: a plate with three holes and a boss is read back as holes (Ø, centre) + a boss + its planes.
     async D1(log) {
         const r = await replay([

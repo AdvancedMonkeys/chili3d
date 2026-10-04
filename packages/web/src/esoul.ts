@@ -34,12 +34,13 @@ import {
     VisualNode,
     type XYZ,
 } from "@chili3d/core";
+import { withShapeCache } from "@chili3d/parametric";
 import { Editor, MainWindow, RibbonUI } from "@chili3d/ui";
 import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.31";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.32";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -778,6 +779,38 @@ function exportChunk(args: { handle?: string; offset?: number; length?: number }
     });
 }
 
+/**
+ * The document as a snapshot an `esoul.replay` edit step loads back (runtime 32). With `shapes`, every built body
+ * carries its finished shape, so the load is a BRep parse instead of a rebuild — the geometry cache behind "open
+ * the model without rebuilding it". Big snapshots leave in chunks on request, through the export stash
+ * (`esoul.exportChunk`), like an export.
+ */
+function snapshot(args: { shapes?: boolean; chunked?: boolean; chunkBytes?: number }): string {
+    const doc = activeDocument();
+    const serialized = args.shapes
+        ? withShapeCache(() => JSON.stringify(doc.serialize()))
+        : JSON.stringify(doc.serialize());
+    const bytes = new TextEncoder().encode(serialized);
+    const chunk = Math.max(
+        65_536,
+        Math.min(EXPORT_CHUNK, Math.floor(Number(args.chunkBytes ?? EXPORT_CHUNK))),
+    );
+    if (!args.chunked || bytes.length <= chunk) {
+        return JSON.stringify({ shapes: !!args.shapes, bytes: bytes.length, serialized });
+    }
+    const handle = `snapshot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    EXPORT_STASH.set(handle, { bytes, fileName: "snapshot.json", format: ".json" });
+    lastExportHandle = handle;
+    while (EXPORT_STASH.size > 8) EXPORT_STASH.delete(EXPORT_STASH.keys().next().value as string);
+    return JSON.stringify({
+        shapes: !!args.shapes,
+        bytes: bytes.length,
+        chunked: true,
+        handle,
+        chunkBytes: chunk,
+    });
+}
+
 async function exportModel(args: {
     format?: string;
     ids?: string[];
@@ -847,6 +880,8 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             return exportChunk(args as { handle?: string; offset?: number; length?: number });
         case "esoul.serialize":
             return JSON.stringify(activeDocument().serialize());
+        case "esoul.snapshot":
+            return snapshot(args as { shapes?: boolean; chunked?: boolean; chunkBytes?: number });
         case "esoul.theme":
             applyThemeMode(args["mode"]);
             return JSON.stringify({ ok: true, mode: Config.instance.themeMode });
