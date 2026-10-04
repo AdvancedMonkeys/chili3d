@@ -10,6 +10,7 @@ import {
     type IFace,
     type INode,
     LENGTH_UNITS,
+    Material,
     Matrix4,
     type ParameterValue,
     Plane,
@@ -18,6 +19,8 @@ import {
     ShapeNode,
     ShapeTypes,
     type UnitSpec,
+    VisualNode,
+    XYZ,
 } from "@chili3d/core";
 import { isBodyTrackingNode } from "../features/bodyTracking";
 import { captureEdgeRef } from "../features/edgeRef";
@@ -58,6 +61,8 @@ export type ParametricOp =
     | FilletChamferOp
     | BooleanOp
     | EditFeatureOp
+    | TransformOp
+    | StyleOp
     | FeaturesOp;
 
 export interface SketchOp {
@@ -88,6 +93,11 @@ export interface SketchOp {
 export interface ExtrudeOp {
     op: "extrude";
     id: string;
+    /** The feature id to mint (ExternalSoul passes `<stepId>:<opId>` so editFeature can name it on any device). */
+    featureId?: string;
+    /** A colour for a NEW body ("#c08457" or "c08457"), with an optional opacity 0..1 — the same as a `style` op after it. */
+    color?: string;
+    opacity?: number;
     /** The node id to mint for a NEW body (ignored when `body` is set). */
     nodeId?: string;
     name?: string;
@@ -104,6 +114,11 @@ export interface ExtrudeOp {
 export interface RevolveOp {
     op: "revolve";
     id: string;
+    /** The feature id to mint (ExternalSoul passes `<stepId>:<opId>` so editFeature can name it on any device). */
+    featureId?: string;
+    /** A colour for a NEW body ("#c08457" or "c08457"), with an optional opacity 0..1 — the same as a `style` op after it. */
+    color?: string;
+    opacity?: number;
     /** The node id to mint. */
     nodeId?: string;
     name?: string;
@@ -116,6 +131,8 @@ export interface RevolveOp {
 export interface FilletChamferOp {
     op: "fillet" | "chamfer";
     id: string;
+    /** The feature id to mint (ExternalSoul passes `<stepId>:<opId>` so editFeature can name it on any device). */
+    featureId?: string;
     name?: string;
     body: string;
     /** Indexes into the body's current edge list (findSubShapes order). */
@@ -127,6 +144,8 @@ export interface FilletChamferOp {
 export interface BooleanOp {
     op: "boolean";
     id: string;
+    /** The feature id to mint (ExternalSoul passes `<stepId>:<opId>` so editFeature can name it on any device). */
+    featureId?: string;
     name?: string;
     body: string;
     operation: BooleanOperation;
@@ -145,6 +164,31 @@ export interface EditFeatureOp {
     index?: number;
 }
 
+/** Move a finished part: rotate about an axis (degrees, about `origin` or the world origin), then translate. */
+export interface TransformOp {
+    op: "transform";
+    id: string;
+    /** The node to move (an op id or a node id); booleans read tools in world space, so a moved tool cuts where it now is. */
+    node: string;
+    translate?: { x?: number; y?: number; z?: number };
+    rotate?: {
+        axis: { x: number; y: number; z: number };
+        angle: number;
+        origin?: { x: number; y: number; z: number };
+    };
+}
+
+/** Colour a node (a body, an imported shape): a material with that colour is found or made in the document. */
+export interface StyleOp {
+    op: "style";
+    id: string;
+    node: string;
+    /** "#c08457" or "c08457". */
+    color: string;
+    /** 0 (clear) .. 1 (solid); default 1. */
+    opacity?: number;
+}
+
 export interface FeaturesOp {
     op: "features";
     id?: string;
@@ -160,6 +204,7 @@ export interface FeatureSummary {
     id: string;
     type: string;
     display: string;
+    /** The user-given name of the feature (the op's `name`), when it has one. */
     name?: string;
     suppressed: boolean;
     error?: string;
@@ -244,6 +289,12 @@ function runOp(state: State, op: ParametricOp): void {
             break;
         case "boolean":
             runBooleanOp(state, op);
+            break;
+        case "transform":
+            runTransformOp(state, op);
+            break;
+        case "style":
+            runStyleOp(state, op);
             break;
         case "editFeature":
             runEditFeatureOp(state, op);
@@ -434,7 +485,8 @@ function runExtrudeOp(state: State, op: ExtrudeOp): void {
     // `profiles` is deliberately left out: an absent list extrudes every closed profile
     // of the sketch, which is what a whole-sketch extrude means.
     const feature: ExtrudeFeatureData = {
-        id: Id.generate(),
+        id: op.featureId ?? Id.generate(),
+        ...(op.name ? { name: op.name } : {}),
         type: "extrude",
         sketchId: sketch.id,
         depth: op.depth,
@@ -471,7 +523,8 @@ function runRevolveOp(state: State, op: RevolveOp): void {
     if (op.angle !== undefined) ensureUnit(op.angle, scope, ANGLE_UNITS, "angle");
 
     const feature: RevolveFeatureData = {
-        id: Id.generate(),
+        id: op.featureId ?? Id.generate(),
+        ...(op.name ? { name: op.name } : {}),
         type: "revolve",
         sketchId: sketch.id,
         // A world-space snapshot; without an `axisSource` there is nothing to re-derive
@@ -517,8 +570,20 @@ function runEdgeCornerOp(state: State, op: FilletChamferOp): void {
 
     const feature: FeatureData =
         op.op === "fillet"
-            ? { id: Id.generate(), type: "fillet", radius: value, edges: refs }
-            : { id: Id.generate(), type: "chamfer", distance: value, edges: refs };
+            ? {
+                  id: op.featureId ?? Id.generate(),
+                  ...(op.name ? { name: op.name } : {}),
+                  type: "fillet",
+                  radius: value,
+                  edges: refs,
+              }
+            : {
+                  id: op.featureId ?? Id.generate(),
+                  ...(op.name ? { name: op.name } : {}),
+                  type: "chamfer",
+                  distance: value,
+                  edges: refs,
+              };
     appendFeature(state, body, feature);
     state.refs.set(op.id, body.id);
 }
@@ -533,7 +598,8 @@ function runBooleanOp(state: State, op: BooleanOp): void {
         }
     }
     appendFeature(state, body, {
-        id: Id.generate(),
+        id: op.featureId ?? Id.generate(),
+        ...(op.name ? { name: op.name } : {}),
         type: "boolean",
         operation: op.operation,
         toolIds: tools.map((tool) => tool.id),
@@ -548,6 +614,12 @@ function runBooleanOp(state: State, op: BooleanOp): void {
 
 function runEditFeatureOp(state: State, op: EditFeatureOp): void {
     const body = resolveBody(state, op.body);
+    if (!body.features.some((feature) => feature.id === op.featureId)) {
+        const known = body.features.map((f) => `${f.id}${f.name ? ` ("${f.name}")` : ""}`).join(", ");
+        throw new Error(
+            `no feature "${op.featureId}" on body "${op.body}" — its features: ${known || "none"}`,
+        );
+    }
     const before = erroredFeatureIds(body);
     switch (op.action) {
         case "setParameter":
@@ -574,6 +646,64 @@ function runEditFeatureOp(state: State, op: EditFeatureOp): void {
     checkBody(state, body, before);
 }
 
+function runTransformOp(state: State, op: TransformOp): void {
+    const node = resolveNode(state, op.node, "transform target");
+    if (!(node instanceof VisualNode))
+        throw new Error(`"${op.node}" is not a visual node and cannot be moved`);
+    let delta = Matrix4.identity();
+    if (op.rotate !== undefined) {
+        const a = op.rotate.axis;
+        const axis = new XYZ(a.x, a.y, a.z);
+        if (axis.length() < 1e-9) throw new Error("rotate.axis must not be zero");
+        const o = op.rotate.origin ?? { x: 0, y: 0, z: 0 };
+        delta = delta.multiply(
+            Matrix4.fromAxisRad(new XYZ(o.x, o.y, o.z), axis, (op.rotate.angle * Math.PI) / 180),
+        );
+    }
+    if (op.translate !== undefined) {
+        const t = op.translate;
+        delta = delta.multiply(Matrix4.fromTranslation(t.x ?? 0, t.y ?? 0, t.z ?? 0));
+    }
+    node.transform = node.transform.multiply(delta);
+    state.refs.set(op.id, node.id);
+    if (node instanceof ParametricBodyNode) state.touched.add(node);
+}
+
+function parseHexColor(text: string): number {
+    const hex = text.trim().replace(/^#/, "");
+    if (!/^[0-9a-fA-F]{6}$/.test(hex))
+        throw new Error(`color must be a 6-digit hex like "#c08457" (got "${text}")`);
+    return Number.parseInt(hex, 16);
+}
+
+/** The document's material with exactly this colour and opacity, made when none exists. */
+function ensureMaterial(document: IDocument, color: number, opacity: number): Material {
+    const same = (m: Material) => {
+        const c =
+            typeof m.color === "number" ? m.color : Number.parseInt(String(m.color).replace(/^#/, ""), 16);
+        return c === color && Math.abs((m.opacity ?? 1) - opacity) < 1e-6;
+    };
+    const existing = document.modelManager.materials.find(same);
+    if (existing) return existing;
+    const material = new Material({ document, name: `#${color.toString(16).padStart(6, "0")}`, color });
+    material.opacity = opacity;
+    document.modelManager.materials.push(material);
+    return material;
+}
+
+function applyStyle(state: State, node: INode, color: string, opacity: number | undefined): void {
+    const target = node as { materialId?: string | string[] };
+    if (!("materialId" in target)) throw new Error(`"${node.name}" has no material and cannot be coloured`);
+    const material = ensureMaterial(state.document, parseHexColor(color), opacity ?? 1);
+    target.materialId = material.id;
+}
+
+function runStyleOp(state: State, op: StyleOp): void {
+    const node = resolveNode(state, op.node, "style target");
+    applyStyle(state, node, op.color, op.opacity);
+    state.refs.set(op.id, node.id);
+}
+
 function runFeaturesOp(state: State, op: FeaturesOp): void {
     state.out.results[op.id ?? "features"] = summarizeFeatures(resolveBody(state, op.body));
 }
@@ -587,6 +717,7 @@ function summarizeFeatures(body: ParametricBodyNode): FeatureSummary[] {
 function featureSummary(item: FeatureItem, type: string | undefined): FeatureSummary {
     const summary: FeatureSummary = {
         id: item.id,
+        ...(item.name ? { name: item.name } : {}),
         type: type ?? "unknown",
         display: item.display,
         suppressed: item.suppressed === true,

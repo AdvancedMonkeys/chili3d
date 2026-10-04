@@ -24,7 +24,17 @@ const OPS_SCHEMA = {
     properties: {
         op: {
             type: "string",
-            enum: ["sketch", "extrude", "revolve", "fillet", "chamfer", "boolean", "editFeature", "features"],
+            enum: [
+                "sketch",
+                "extrude",
+                "revolve",
+                "fillet",
+                "chamfer",
+                "boolean",
+                "editFeature",
+                "transform",
+                "features",
+            ],
             description: "Which operation to run",
         },
         id: {

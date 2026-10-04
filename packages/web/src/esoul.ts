@@ -23,7 +23,9 @@ import {
     type IDocument,
     type IHistoryRecord,
     type INode,
+    type IShape,
     Logger,
+    Matrix4,
     VisualNode,
 } from "@chili3d/core";
 import { Editor, MainWindow, RibbonUI } from "@chili3d/ui";
@@ -31,7 +33,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.16";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.17";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -130,11 +132,40 @@ async function openSnapshot(serialized: string): Promise<IDocument> {
 
 /** Creating ops mint deterministic node ids: `<stepId>:<opId>` — the same on every device, every replay. */
 function withDeterministicIds(stepId: string, ops: unknown[]): unknown[] {
-    return ops.map((raw) => {
-        const op = raw as { op?: string; id?: string; nodeId?: string; body?: string };
-        if (!op || typeof op !== "object" || op.nodeId || !op.id) return raw;
+    return ops.flatMap((raw) => {
+        const op = raw as {
+            op?: string;
+            id?: string;
+            nodeId?: string;
+            body?: string;
+            color?: string;
+            opacity?: number;
+        };
+        if (!op || typeof op !== "object" || !op.id) return [raw];
         const creates = op.op === "sketch" || op.op === "revolve" || (op.op === "extrude" && !op.body);
-        return creates ? { ...op, nodeId: `${stepId}:${op.id}` } : raw;
+        const makesFeature =
+            op.op === "extrude" ||
+            op.op === "revolve" ||
+            op.op === "fillet" ||
+            op.op === "chamfer" ||
+            op.op === "boolean";
+        const withFeature =
+            makesFeature && !(op as { featureId?: string }).featureId
+                ? { featureId: `${stepId}:${op.id}` }
+                : {};
+        const withNode = creates && !op.nodeId ? { nodeId: `${stepId}:${op.id}` } : {};
+        const out: unknown[] = [creates || makesFeature ? { ...op, ...withFeature, ...withNode } : raw];
+        // `color` on a body-making op is sugar for a `style` op right after it (the body exists by then).
+        if (creates && op.op !== "sketch" && typeof op.color === "string") {
+            out.push({
+                op: "style",
+                id: `${op.id}__style`,
+                node: op.id,
+                color: op.color,
+                ...(op.opacity !== undefined ? { opacity: op.opacity } : {}),
+            });
+        }
+        return out;
     });
 }
 
@@ -169,7 +200,79 @@ async function describeBodies(doc: IDocument): Promise<unknown[]> {
         error?: string;
     };
     if (parsed.error) throw new Error(parsed.error);
-    return parsed.bodies ?? [];
+    return withExtents(doc, parsed.bodies ?? []);
+}
+
+/** Where each reported body IS (world space) and how big: an agent reads this from the fold, no kernel round trip. */
+function withExtents(doc: IDocument, reported: unknown[]): unknown[] {
+    return reported.map((pb) => {
+        const id = (pb as { nodeId?: string }).nodeId;
+        const node = id ? doc.modelManager.findNodes((x) => x.id === id)[0] : undefined;
+        const e = node ? worldExtents(node) : undefined;
+        return e ? { ...(pb as object), ...e } : pb;
+    });
+}
+
+/** A node's shape in world space (a copy when the node is transformed) — the caller disposes `owned`. */
+function worldShape(node: INode): { shape: IShape; owned: boolean } | undefined {
+    const sn = node as { shape?: { isOk: boolean; value: IShape }; worldTransform?: () => Matrix4 };
+    if (!sn.shape?.isOk || typeof sn.worldTransform !== "function") return undefined;
+    const m = sn.worldTransform();
+    if (m.equals(Matrix4.identity())) return { shape: sn.shape.value, owned: false };
+    return { shape: sn.shape.value.transformedMul(m), owned: true };
+}
+const disposeOwned = (w: { shape: IShape; owned: boolean } | undefined) => {
+    if (w?.owned) (w.shape as { dispose?: () => void }).dispose?.();
+};
+const r3 = (n: number) => Math.round(n * 1000) / 1000;
+function worldExtents(node: INode): { bbox: unknown; volume: number } | undefined {
+    const w = worldShape(node);
+    if (!w) return undefined;
+    try {
+        const bb = w.shape.boundingBox();
+        return {
+            bbox: {
+                min: { x: r3(bb.min.x), y: r3(bb.min.y), z: r3(bb.min.z) },
+                max: { x: r3(bb.max.x), y: r3(bb.max.y), z: r3(bb.max.z) },
+            },
+            volume: r3(w.shape.volume()),
+        };
+    } finally {
+        disposeOwned(w);
+    }
+}
+
+/** Read-only measurement: never creates, consumes or moves a node (run_program's boolean methods do all three). */
+function measure(args: { nodes?: string[]; pairs?: [string, string][] }): string {
+    const doc = activeDocument();
+    const byId = (id: string): INode => {
+        const n = doc.modelManager.findNodes((x) => x.id === id)[0];
+        if (!n) throw new Error(`no node "${id}" in the document`);
+        return n;
+    };
+    const nodes = (args.nodes ?? []).map((id) => {
+        const n = byId(id);
+        return { id, name: n.name, ...(worldExtents(n) ?? { bbox: null, volume: null }) };
+    });
+    const pairs = (args.pairs ?? []).map(([aId, bId]) => {
+        const a = worldShape(byId(aId));
+        const b = worldShape(byId(bId));
+        if (!a || !b) return { a: aId, b: bId, error: "a node without a shape" };
+        try {
+            const distance = a.shape.extremaDistance(b.shape);
+            const common = shapeFactory.booleanCommon([a.shape.clone()], [b.shape.clone()]);
+            let interference: number | null = null;
+            if (common.isOk) {
+                interference = r3(common.value.volume());
+                (common.value as { dispose?: () => void }).dispose?.();
+            }
+            return { a: aId, b: bId, distance: r3(distance), interference };
+        } finally {
+            disposeOwned(a);
+            disposeOwned(b);
+        }
+    });
+    return JSON.stringify({ nodes, pairs });
 }
 
 /** Rebuild the model from intent, starting at the last snapshot (it contains everything before it). */
@@ -226,7 +329,7 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
                     stepId: step.id,
                     ok: true,
                     created: parsed.created ?? [],
-                    bodies: parsed.bodies ?? [],
+                    bodies: withExtents(activeDocument(), parsed.bodies ?? []),
                 });
             } catch (err) {
                 applied.push({
@@ -314,6 +417,8 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             return JSON.stringify({ ok: true, mode: Config.instance.themeMode });
         case "esoul.bodies":
             return JSON.stringify({ bodies: await describeBodies(activeDocument()) });
+        case "esoul.measure":
+            return measure(args as { nodes?: string[]; pairs?: [string, string][] });
         default:
             return callTool(method, args);
     }
@@ -479,6 +584,7 @@ document.body.appendChild(loading);
  *  named after the ExternalSoul app instance (`?name=`). */
 function tidyChrome() {
     document.getElementById("appName")?.remove();
+    tidyStatusBar();
     document.querySelector('a[href*="github.com/xiangechen"]')?.remove();
     for (const use of Array.from(document.querySelectorAll("svg use"))) {
         const href = use.getAttribute("href") ?? use.getAttribute("xlink:href") ?? "";
@@ -488,6 +594,37 @@ function tidyChrome() {
             if (svg && svg.closest("[class*=titleBar], [class*=title-bar], [class*=center]")) svg.remove();
         }
     }
+}
+
+/**
+ * The status bar in a narrow frame: chili lets the hint wrap under the snap toggles (two lines
+ * fighting for one row). One line each: the hint ends in an ellipsis, the snap row scrolls.
+ */
+function tidyStatusBar() {
+    const bar = document.querySelector("chili-statusbar") ?? document.querySelector('[class*="statusbar"]');
+    if (!(bar instanceof HTMLElement)) return;
+    const [left, right] = Array.from(bar.children) as HTMLElement[];
+    Object.assign(bar.style, { minWidth: "0", overflow: "hidden", gap: "8px", alignItems: "center" });
+    if (left) {
+        Object.assign(left.style, { minWidth: "0", flex: "1 1 auto", overflow: "hidden" });
+        const tip = left.firstElementChild as HTMLElement | null;
+        if (tip)
+            Object.assign(tip.style, {
+                display: "block",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+            });
+    }
+    if (right)
+        Object.assign(right.style, {
+            flex: "0 1 auto",
+            minWidth: "0",
+            overflowX: "auto",
+            overflowY: "hidden",
+            whiteSpace: "nowrap",
+            scrollbarWidth: "none",
+        });
 }
 
 const DOCUMENT_NAME = (params.get("name") ?? "").trim().slice(0, 60) || "Model";
