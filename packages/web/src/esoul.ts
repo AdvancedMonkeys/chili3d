@@ -40,7 +40,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.34";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.35";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -600,18 +600,96 @@ async function gunzip(b: Uint8Array): Promise<Uint8Array> {
     return new Uint8Array(await new Response(inflated).arrayBuffer());
 }
 
+/** One range of a URL input (64 KB — the size the platform measured as safe). */
+const RANGE_CHUNK = 65_536;
+/** Ranges in flight at once. */
+const RANGE_PARALLEL = 8;
+/** A range that has not answered in this long is asked for again, up to RANGE_RETRIES times. */
+const RANGE_TIMEOUT_MS = 20_000;
+const RANGE_RETRIES = 3;
+
+async function fetchWithTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), ms);
+    try {
+        return await fetch(url, { ...init, signal: ctl.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * A URL input's bytes, read in RANGES. One unbounded GET of a big blob can stall at a few KB/s behind the CDN
+ * while ranged reads of the same bytes finish in a second (the platform's own measurement, 2026-08-03, and the
+ * geometry cache that answered its headers and then never its body inside a tab, 2026-10-05). Each range has its
+ * own timeout and retries, so a stall costs seconds and a retry, never the whole load. A server that gives no
+ * length, a small file, or a server that answers a range with the whole body (200) is read in one GET. A gzipped
+ * file (the geometry cache: 22 MB of BRep text travels as 5) is inflated here, whatever the server called it —
+ * the magic bytes decide, not the name or a header.
+ */
+async function fetchUrlBytes(url: string): Promise<Uint8Array> {
+    const where = url.slice(0, 96);
+    const inflate = (b: Uint8Array) => (isGzip(b) ? gunzip(b) : Promise.resolve(b));
+    const head = await fetchWithTimeout(url, { method: "HEAD" }, RANGE_TIMEOUT_MS).catch(() => null);
+    const total = Number(head?.headers.get("content-length") ?? 0);
+    if (!head?.ok || !(total > RANGE_CHUNK)) {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`fetching ${where}: HTTP ${r.status}`);
+        return inflate(new Uint8Array(await r.arrayBuffer()));
+    }
+    const n = Math.ceil(total / RANGE_CHUNK);
+    const parts: Uint8Array[] = new Array(n);
+    let next = 0;
+    let whole: Uint8Array | null = null;
+    const t0 = performance.now();
+    const worker = async () => {
+        while (next < n && !whole) {
+            const k = next++;
+            const start = k * RANGE_CHUNK;
+            const end = Math.min(total, start + RANGE_CHUNK) - 1;
+            let lastErr: unknown;
+            for (let attempt = 0; attempt < RANGE_RETRIES && !whole; attempt++) {
+                try {
+                    const r = await fetchWithTimeout(
+                        url,
+                        { headers: { Range: `bytes=${start}-${end}` } },
+                        RANGE_TIMEOUT_MS,
+                    );
+                    if (r.status === 200) {
+                        // ranges ignored: the whole body came — take it
+                        whole = new Uint8Array(await r.arrayBuffer());
+                        return;
+                    }
+                    if (r.status !== 206)
+                        throw new Error(`fetching ${where} (bytes ${start}-${end}): HTTP ${r.status}`);
+                    parts[k] = new Uint8Array(await r.arrayBuffer());
+                    lastErr = undefined;
+                    break;
+                } catch (err) {
+                    lastErr = err;
+                }
+            }
+            if (lastErr && !whole) throw lastErr;
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(RANGE_PARALLEL, n) }, worker));
+    if (whole) return inflate(whole);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) {
+        out.set(p, off);
+        off += p.length;
+    }
+    if (off !== total) throw new Error(`fetching ${where}: ${off} of ${total} bytes arrived`);
+    console.info(`[esoul] fetched ${total} bytes in ${n} ranges, ${Math.round(performance.now() - t0)} ms`);
+    return inflate(out);
+}
+
 /** Big inputs come by URL: the page fetches them itself, so no bridge message has to carry their bytes
  *  (an edit snapshot's `url` becomes its `serialized` text; an import op's `url` becomes its `base64`). */
 async function resolveStepUrls(steps: ReplayStep[]): Promise<void> {
     const jobs: Promise<void>[] = [];
-    const fetchBytes = async (url: string): Promise<Uint8Array> => {
-        const r = await fetch(url);
-        if (!r.ok) throw new Error(`fetching ${url.slice(0, 96)}: HTTP ${r.status}`);
-        const b = new Uint8Array(await r.arrayBuffer());
-        // A gzipped file (the app's geometry cache: 22 MB of BRep text travels as 5) is inflated here, whatever the
-        // server called it — the magic bytes decide, not the name or a header.
-        return isGzip(b) ? gunzip(b) : b;
-    };
+    const fetchBytes = fetchUrlBytes;
     for (const step of steps) {
         if (step.kind === "edit") {
             if (step.serialized === undefined && typeof step.url === "string") {

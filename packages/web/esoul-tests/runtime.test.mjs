@@ -1339,6 +1339,34 @@ const tests = {
         });
         if (bad.ok || !/HTTP 404/.test(bad.error ?? ""))
             return log.fail(`a missing cache URL answered ${bad.ok ? "ok" : bad.error}`);
+        // a file above one range (64 KB) by URL is read in RANGES (the test server answers HEAD + 206): a plate with
+        // forty holes, its plain shapes snapshot, loaded back to the same volume
+        const holes = [];
+        for (let i = 0; i < 40; i++)
+            holes.push({ type: "circle", params: [8 + (i % 10) * 20, 15 + Math.floor(i / 10) * 25, 3] });
+        const r3 = await replay([
+            {
+                id: "big",
+                ops: [
+                    { op: "sketch", id: "s", plane: "XY", entities: [...rect(0, 0, 210, 110), ...holes] },
+                    { op: "extrude", id: "plate", sketch: "s", name: "Plate", depth: 4 },
+                ],
+            },
+        ]);
+        if (r3.failed.length) return log.fail(`the forty-hole plate: ${r3.failed[0].error}`);
+        const bigVol = JSON.parse(content(await rpc("esoul.measure", { nodes: ["big:plate"], pairs: [] })))
+            .nodes[0].volume;
+        const bigSnap = JSON.parse(content(await rpc("esoul.snapshot", { shapes: true })));
+        if (bigSnap.bytes <= 65_536)
+            return log.fail(`the big fixture is ${bigSnap.bytes} B — too small to exercise ranges`);
+        fs.writeFileSync(path.join(OUT, "e5-big.json"), bigSnap.serialized);
+        const r4 = await replay([{ id: "c2", kind: "edit", url: `${ORIGIN}/__out__/e5-big.json` }]);
+        if (r4.failed.length) return log.fail(`loading the big snapshot by URL: ${r4.failed[0].error}`);
+        const v4 = JSON.parse(content(await rpc("esoul.measure", { nodes: ["big:plate"], pairs: [] })))
+            .nodes[0].volume;
+        if (Math.abs(v4 - bigVol) > 1e-6)
+            return log.fail(`the plate from the ranged load differs: ${v4} vs ${bigVol}`);
+        log.note(`big snapshot ${bigSnap.bytes} B read in ${Math.ceil(bigSnap.bytes / 65536)} ranges`);
         return log.ok();
     },
     // D1 — esoul.describe: a plate with three holes and a boss is read back as holes (Ø, centre) + a boss + its planes.

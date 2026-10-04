@@ -66,10 +66,31 @@ export function serveStatic(dir) {
                 res.end("not found");
                 return;
             }
-            res.writeHead(200, {
+            // HEAD and Range, as a blob store answers them: the runtime reads big inputs in ranges (runtime 35).
+            const size = fs.statSync(file).size;
+            const base = {
                 "content-type": MIME[path.extname(file)] ?? "application/octet-stream",
                 "cache-control": "no-store",
-            });
+                "accept-ranges": "bytes",
+            };
+            if (req.method === "HEAD") {
+                res.writeHead(200, { ...base, "content-length": size });
+                res.end();
+                return;
+            }
+            const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? "");
+            if (m) {
+                const start = Number(m[1]);
+                const end = m[2] ? Math.min(Number(m[2]), size - 1) : size - 1;
+                res.writeHead(206, {
+                    ...base,
+                    "content-length": end - start + 1,
+                    "content-range": `bytes ${start}-${end}/${size}`,
+                });
+                fs.createReadStream(file, { start, end }).pipe(res);
+                return;
+            }
+            res.writeHead(200, { ...base, "content-length": size });
             fs.createReadStream(file).pipe(res);
         });
         server.listen(0, "127.0.0.1", () =>
