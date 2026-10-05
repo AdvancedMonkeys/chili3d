@@ -16,6 +16,7 @@ import type { Tool, ToolResult } from "@chili3d/ai/src/llm/types";
 import { buildTools } from "@chili3d/ai/src/tools";
 import { AppBuilder } from "@chili3d/builder";
 import {
+    ArrayRecord,
     Config,
     History,
     I18n,
@@ -25,12 +26,18 @@ import {
     type IFace,
     type IHistoryRecord,
     type INode,
+    type INodeLinkedList,
     type IShape,
     type ISurface,
     type IWire,
     Logger,
+    Material,
     Matrix4,
+    NodeLinkedListHistoryRecord,
+    PropertyHistoryRecord,
+    Serializer,
     ShapeTypes,
+    Transaction,
     VisualNode,
     type XYZ,
 } from "@chili3d/core";
@@ -40,7 +47,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.35";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.36";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -183,7 +190,231 @@ function withDeterministicIds(stepId: string, ops: unknown[]): unknown[] {
 
 type ReplayStep =
     | { id: string; kind: "program"; ops: unknown[] }
-    | { id: string; kind: "edit"; serialized?: string; url?: string };
+    | { id: string; kind: "edit"; serialized?: string; url?: string; delta?: EditDelta };
+
+// ------------------------------------------------------------- a hand edit as a DELTA (runtime 36)
+//
+// A gesture in the UI used to leave as the whole document (2.9 MB for a 31-step assembly): too big for the
+// parent's event log, so it had to be uploaded as a file — and a tab with no network lost the edit. chili's own
+// history says exactly what a gesture changed: property records (object, property, old, new) and node records
+// (add / remove / move). Those become a delta of a few KB that rides inside the event, replays onto any build,
+// and merges: two devices that touch different nodes never clash, and a clash on one property is a fact the
+// parent can show. The old whole-document snapshot stays as the fallback for a gesture the records cannot name.
+
+type DeltaTarget = { nodeId: string } | { materialId: string };
+type DeltaOp =
+    | { op: "set"; target: DeltaTarget; property: string; value: unknown }
+    | { op: "add"; node: Record<string, unknown>; parentId: string | null; previousId: string | null }
+    | { op: "remove"; nodeId: string }
+    | { op: "move"; nodeId: string; parentId: string | null; previousId: string | null };
+interface EditDelta {
+    v: 1;
+    ops: DeltaOp[];
+}
+/** Per target key ("node:<id>" / "material:<id>"), per property: the serialised value BEFORE the gesture. */
+type EditBase = Record<string, Record<string, unknown>>;
+/** The most a delta may weigh before the gesture falls back to a snapshot (the parent's log entries stay small). */
+const DELTA_MAX_CHARS = 200_000;
+
+const targetKey = (t: DeltaTarget) => ("nodeId" in t ? `node:${t.nodeId}` : `material:${t.materialId}`);
+
+/** A value as the parent can carry it: chili's registered classes through the Serializer, plain records as
+ *  JSON, primitives as they are. Throws for anything else — the caller falls back to a snapshot. */
+function serializeValue(value: unknown): unknown {
+    if (value === null || value === undefined) return null;
+    if (Array.isArray(value)) return value.map(serializeValue);
+    const t = typeof value;
+    if (t === "object") {
+        if ((value as object).constructor === Object) return JSON.parse(JSON.stringify(value));
+        return Serializer.serializeObject(value as object);
+    }
+    if (t === "function" || t === "symbol") throw new Error(`unserializable ${t}`);
+    return value;
+}
+
+function flattenRecords(record: IHistoryRecord, out: IHistoryRecord[]) {
+    if (record instanceof ArrayRecord) {
+        for (const r of record.records) flattenRecords(r, out);
+    } else out.push(record);
+}
+
+function findNode(doc: IDocument, id: string): INode | undefined {
+    return doc.modelManager.findNodes((n) => n.id === id)[0];
+}
+
+function serializeNode(node: INode): Record<string, unknown> {
+    return Serializer.serializeObject(node) as Record<string, unknown>;
+}
+
+/**
+ * The delta of one gesture, from the history records it committed, as the document stands when the gesture is
+ * flushed — or null when a record names something the delta cannot address (then the whole document goes, as
+ * before). Node adds carry the node's final state, so sets on a node added in the same gesture are dropped; a
+ * node added and removed in one gesture is judged by whether it is in the document now.
+ */
+function deltaFromRecords(
+    doc: IDocument,
+    records: IHistoryRecord[],
+): { delta: EditDelta; base: EditBase } | null {
+    const flat: IHistoryRecord[] = [];
+    for (const r of records) flattenRecords(r, flat);
+    const added = new Map<string, INode>();
+    const removed = new Map<string, INode>();
+    const moved = new Map<string, INode>();
+    const sets = new Map<string, { target: DeltaTarget; property: string; first: unknown; last: unknown }>();
+    const order: string[] = [];
+    for (const r of flat) {
+        if (r instanceof NodeLinkedListHistoryRecord) {
+            for (const nr of r.records) {
+                const node = nr.node;
+                if (nr.action === "add") added.set(node.id, node);
+                else if (nr.action === "remove") removed.set(node.id, node);
+                else moved.set(node.id, node);
+            }
+            continue;
+        }
+        if (r instanceof PropertyHistoryRecord) {
+            if (typeof r.property !== "string") return null;
+            const object = r.object as unknown;
+            let target: DeltaTarget | null = null;
+            if (object instanceof Material) target = { materialId: object.id };
+            else if (object && typeof object === "object" && typeof (object as INode).id === "string")
+                target = { nodeId: (object as INode).id };
+            if (!target) return null;
+            const key = `${targetKey(target)}\u0000${r.property}`;
+            const cur = sets.get(key);
+            if (cur) cur.last = r.newValue;
+            else {
+                sets.set(key, { target, property: r.property, first: r.oldValue, last: r.newValue });
+                order.push(key);
+            }
+            continue;
+        }
+        return null; // a record kind the delta cannot express
+    }
+    const present = (id: string) => findNode(doc, id) !== undefined;
+    const ops: DeltaOp[] = [];
+    const base: EditBase = {};
+    for (const [id, node] of added) {
+        if (!present(id)) continue; // added and removed again
+        ops.push({
+            op: "add",
+            node: serializeNode(node),
+            parentId: node.parent?.id ?? null,
+            previousId: node.previousSibling?.id ?? null,
+        });
+    }
+    for (const [id, node] of moved) {
+        if (added.has(id) || !present(id)) continue;
+        ops.push({
+            op: "move",
+            nodeId: id,
+            parentId: node.parent?.id ?? null,
+            previousId: node.previousSibling?.id ?? null,
+        });
+    }
+    for (const key of order) {
+        const s = sets.get(key);
+        if (!s) continue;
+        if ("nodeId" in s.target) {
+            if (added.has(s.target.nodeId) || removed.has(s.target.nodeId)) continue;
+            if (!present(s.target.nodeId)) return null;
+        } else if (
+            !doc.modelManager.materials.find((m) => m.id === (s.target as { materialId: string }).materialId)
+        )
+            return null;
+        const first = serializeValue(s.first);
+        const last = serializeValue(s.last);
+        if (JSON.stringify(first) === JSON.stringify(last)) continue; // the gesture put it back
+        ops.push({ op: "set", target: s.target, property: s.property, value: last });
+        const tk = targetKey(s.target);
+        const forTarget = base[tk] ?? {};
+        forTarget[s.property] = first;
+        base[tk] = forTarget;
+    }
+    for (const id of removed.keys()) {
+        if (present(id)) continue; // removed and added back
+        ops.push({ op: "remove", nodeId: id });
+    }
+    const delta: EditDelta = { v: 1, ops };
+    if (ops.length === 0 || JSON.stringify(delta).length + JSON.stringify(base).length > DELTA_MAX_CHARS)
+        return null;
+    return { delta, base };
+}
+
+/** The nodes a delta touches (adds, moves, sets, removes), for the replay's report. */
+function deltaNodeIds(delta: EditDelta): string[] {
+    const ids = new Set<string>();
+    for (const op of delta.ops) {
+        if (op.op === "add") ids.add(String(op.node.id ?? ""));
+        else if (op.op === "set") {
+            if ("nodeId" in op.target) ids.add(op.target.nodeId);
+        } else ids.add(op.nodeId);
+    }
+    ids.delete("");
+    return [...ids];
+}
+
+/**
+ * Apply a delta to the live document — in a replay and in a mounted viewer taking another device's edit. History
+ * is off while it runs (a remote edit is not on this person's undo stack) and the bridge is driving (nothing
+ * here is reported back as a new edit). Every op either lands or throws with the thing it could not find.
+ */
+function applyDelta(doc: IDocument, delta: EditDelta): void {
+    const history = doc.history as History;
+    const wasDisabled = history.disabled;
+    history.disabled = true;
+    driving++;
+    try {
+        for (const op of delta.ops) {
+            if (op.op === "add") {
+                const node = Serializer.deserializeObject(doc, op.node as never) as INode;
+                const parent = (op.parentId ? findNode(doc, op.parentId) : undefined) as
+                    | INodeLinkedList
+                    | undefined;
+                const list = parent ?? doc.modelManager.rootNode;
+                const previous = op.previousId ? findNode(doc, op.previousId) : undefined;
+                if (previous) list.insertAfter(previous, node);
+                else list.add(node);
+            } else if (op.op === "remove") {
+                const node = findNode(doc, op.nodeId);
+                if (!node) throw new Error(`delta: no node ${op.nodeId} to remove`);
+                node.parent?.remove(node);
+            } else if (op.op === "move") {
+                const node = findNode(doc, op.nodeId);
+                if (!node) throw new Error(`delta: no node ${op.nodeId} to move`);
+                const parent = (op.parentId ? findNode(doc, op.parentId) : undefined) as
+                    | INodeLinkedList
+                    | undefined;
+                const list = parent ?? doc.modelManager.rootNode;
+                const previous = op.previousId ? findNode(doc, op.previousId) : undefined;
+                if (node.parent) node.parent.move(node, list as never, previous);
+                else if (previous) list.insertAfter(previous, node);
+                else list.add(node);
+            } else {
+                const target: unknown =
+                    "nodeId" in op.target
+                        ? findNode(doc, op.target.nodeId)
+                        : doc.modelManager.materials.find(
+                              (m) => m.id === (op.target as { materialId: string }).materialId,
+                          );
+                if (!target) throw new Error(`delta: no ${targetKey(op.target)} to set ${op.property} on`);
+                const value = Serializer.deserialValue(doc, op.value);
+                if (Serializer.isWritable(target, op.property))
+                    (target as Record<string, unknown>)[op.property] = value;
+                else if (typeof (target as { setPrivateValue?: unknown }).setPrivateValue === "function")
+                    (target as { setPrivateValue: (k: string, v: unknown) => void }).setPrivateValue(
+                        op.property,
+                        value,
+                    );
+                else throw new Error(`delta: ${targetKey(op.target)}.${op.property} is not writable`);
+            }
+        }
+    } finally {
+        driving--;
+        history.disabled = wasDisabled;
+    }
+}
 interface ReplayArgs {
     variables?: { name: string; type: string; expression: string }[];
     steps?: ReplayStep[];
@@ -228,6 +459,30 @@ async function describeBodies(doc: IDocument): Promise<unknown[]> {
 }
 
 /** Where each reported body IS (world space) and how big: an agent reads this from the fold, no kernel round trip. */
+/** The parametric bodies among these node ids, described as a replay reports them. */
+async function describeNodes(doc: IDocument, ids: string[]): Promise<unknown[]> {
+    const bodies = ids
+        .map((id) => findNode(doc, id))
+        .filter((n): n is INode => !!n && isParametricBody(n) && !isConsumedTool(n));
+    if (bodies.length === 0) return [];
+    const r = await callTool("run_parametric", {
+        ops: bodies.map((b, i) => ({ op: "features", id: `f${i}`, body: b.id })),
+    });
+    const parsed = JSON.parse(typeof r === "string" ? r : r.content) as {
+        results?: Record<string, unknown>;
+        error?: string;
+    };
+    if (parsed.error) throw new Error(parsed.error);
+    return withExtents(
+        doc,
+        bodies.map((b, i) => ({
+            nodeId: b.id,
+            name: b.name,
+            features: (parsed.results?.[`f${i}`] as unknown[] | undefined) ?? [],
+        })),
+    );
+}
+
 function withExtents(doc: IDocument, reported: unknown[]): unknown[] {
     return reported.map((pb) => {
         const id = (pb as { nodeId?: string }).nodeId;
@@ -736,7 +991,8 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
             console.info(`[esoul] replay ${what} at ${Math.round(performance.now() - t0)} ms`);
         await resolveStepUrls(steps);
         phase(`inputs resolved (${steps.length} step(s))`);
-        const lastEdit = steps.map((s) => s.kind).lastIndexOf("edit");
+        // Only a whole-document snapshot resets the document; a delta edit applies onto whatever stands.
+        const lastEdit = steps.map((s) => s.kind === "edit" && !s.delta).lastIndexOf(true);
         const applied: Applied[] = [];
         if (lastEdit >= 0) {
             const edit = steps[lastEdit] as Extract<ReplayStep, { kind: "edit" }>;
@@ -777,7 +1033,28 @@ async function replay(args: ReplayArgs): Promise<ToolResult> {
         }
         phase("variables set");
         for (const step of steps.slice(lastEdit + 1)) {
-            if (step.kind !== "program") continue;
+            if (step.kind === "edit") {
+                if (!step.delta) continue;
+                try {
+                    applyDelta(activeDocument(), step.delta);
+                    applied.push({
+                        stepId: step.id,
+                        ok: true,
+                        created: [],
+                        bodies: await describeNodes(activeDocument(), deltaNodeIds(step.delta)),
+                    });
+                } catch (err) {
+                    applied.push({
+                        stepId: step.id,
+                        ok: false,
+                        error: (err as Error).message,
+                        created: [],
+                        bodies: [],
+                    });
+                    break;
+                }
+                continue;
+            }
             try {
                 const r = await callTool("run_parametric", { ops: withDeterministicIds(step.id, step.ops) });
                 const parsed = JSON.parse(typeof r === "string" ? r : r.content) as {
@@ -975,6 +1252,91 @@ async function exportModel(args: {
     };
 }
 
+/**
+ * Apply ONE step onto the document as it stands — a program, or a delta edit — for a mounted viewer taking a step
+ * another device or an agent appended, without rebuilding everything and without moving the camera. A gesture in
+ * flight here is flushed first, so its own edit leaves before the other one lands. A snapshot edit cannot be
+ * applied this way (it replaces the document): the parent replays instead.
+ */
+async function applyStep(args: { step: ReplayStep }): Promise<string> {
+    const step = args.step;
+    if (!step || typeof step !== "object") throw new Error("applyStep: no step");
+    if (editTimer) flushEdit();
+    const doc = activeDocument();
+    let a: Applied;
+    if (step.kind === "edit") {
+        if (!step.delta) throw new Error("applyStep: a snapshot edit must be replayed, not applied");
+        try {
+            applyDelta(doc, step.delta);
+            a = {
+                stepId: step.id,
+                ok: true,
+                created: [],
+                bodies: await describeNodes(doc, deltaNodeIds(step.delta)),
+            };
+        } catch (err) {
+            a = { stepId: step.id, ok: false, error: (err as Error).message, created: [], bodies: [] };
+        }
+    } else {
+        driving++;
+        try {
+            const r = await callTool("run_parametric", { ops: withDeterministicIds(step.id, step.ops) });
+            const parsed = JSON.parse(typeof r === "string" ? r : r.content) as {
+                error?: string;
+                created?: unknown[];
+                bodies?: unknown[];
+            };
+            if (parsed.error) throw new Error(parsed.error);
+            const bodies = (parsed.bodies ?? []).filter((b) => {
+                const id = (b as { nodeId?: string }).nodeId;
+                const n = id ? findNode(doc, id) : undefined;
+                return n === undefined || !isConsumedTool(n);
+            });
+            a = {
+                stepId: step.id,
+                ok: true,
+                created: parsed.created ?? [],
+                bodies: withExtents(doc, bodies),
+            };
+        } catch (err) {
+            a = { stepId: step.id, ok: false, error: (err as Error).message, created: [], bodies: [] };
+        } finally {
+            driving--;
+            forgetPendingEdit();
+        }
+    }
+    if (app?.activeView?.document) lastKnownNames = topNames(app.activeView.document);
+    return JSON.stringify({ applied: [a], runtimeVersion: RUNTIME_VERSION });
+}
+
+type SimulatedEditOp = { nodeId: string; property?: string; value?: unknown; remove?: boolean };
+
+/**
+ * A person's gesture, made from outside (the runtime tests, a harness): property sets and removes inside one
+ * transaction with history ON and the bridge NOT driving — exactly what chili's own commands record — so the
+ * capture hook sees it and posts the edit the way a real gesture leaves.
+ */
+async function simulateEdit(args: { ops: SimulatedEditOp[] }): Promise<string> {
+    const doc = activeDocument();
+    const ops = Array.isArray(args.ops) ? args.ops : [];
+    Transaction.execute(doc, "esoul.simulateEdit", () => {
+        for (const op of ops) {
+            const node = findNode(doc, op.nodeId);
+            if (!node) throw new Error(`simulateEdit: no node ${op.nodeId}`);
+            if (op.remove) {
+                node.parent?.remove(node);
+                continue;
+            }
+            if (!op.property) throw new Error("simulateEdit: property or remove");
+            (node as unknown as Record<string, unknown>)[op.property] = Serializer.deserialValue(
+                doc,
+                op.value,
+            );
+        }
+    });
+    return JSON.stringify({ ok: true, ops: ops.length, pendingEdit: !!editTimer });
+}
+
 async function dispatch(method: string, args: Record<string, unknown>): Promise<string | ToolResult> {
     switch (method) {
         case "esoul.ping":
@@ -985,6 +1347,10 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             );
         case "esoul.replay":
             return replay(args as ReplayArgs);
+        case "esoul.applyStep":
+            return applyStep(args as { step: ReplayStep });
+        case "esoul.simulateEdit":
+            return simulateEdit(args as { ops: SimulatedEditOp[] });
         case "esoul.export":
             return exportModel(args as { format?: string; ids?: string[]; name?: string; chunked?: boolean });
         case "esoul.exportChunk":
@@ -1044,12 +1410,14 @@ window.addEventListener("message", async (event: MessageEvent) => {
 
 let editTimer: ReturnType<typeof setTimeout> | undefined;
 let editLabels: string[] = [];
+let editRecords: IHistoryRecord[] = [];
 
 /** Anything the bridge itself just did is not a person's edit. */
 function forgetPendingEdit() {
     if (editTimer) clearTimeout(editTimer);
     editTimer = undefined;
     editLabels = [];
+    editRecords = [];
 }
 
 function summarize(doc: IDocument): string {
@@ -1101,20 +1469,30 @@ function describeLabels(labels: string[], before: string[] | undefined, after: s
 function flushEdit() {
     editTimer = undefined;
     const labels = editLabels;
+    const records = editRecords;
     editLabels = [];
+    editRecords = [];
     const before = namesBeforeEdit;
     namesBeforeEdit = undefined;
     if (!app?.activeView?.document || labels.length === 0) return;
     const doc = app.activeView.document;
     try {
-        const serialized = JSON.stringify(doc.serialize());
         const after = topNames(doc);
-        post({
+        let packed: { delta: EditDelta; base: EditBase } | null = null;
+        try {
+            packed = deltaFromRecords(doc, records);
+        } catch (err) {
+            Logger.warn(
+                `esoul edit: no delta for this gesture (${(err as Error).message}); sending the snapshot`,
+            );
+        }
+        const common = {
             type: "edit",
             label: describeLabels(labels, before, after),
             summary: summarize(doc),
-            serialized,
-        });
+        };
+        if (packed) post({ ...common, delta: packed.delta, base: packed.base });
+        else post({ ...common, serialized: JSON.stringify(doc.serialize()) });
         lastKnownNames = after;
     } catch (err) {
         Logger.error(`esoul edit capture failed: ${(err as Error).message}`);
@@ -1128,6 +1506,7 @@ History.prototype.add = function esoulCapturingAdd(this: History, record: IHisto
     if (driving > 0 || !parentOrigin) return;
     if (this.isUndoing || this.isRedoing) return;
     editLabels.push(String((record as { name?: string }).name ?? "edit"));
+    editRecords.push(record);
     if (namesBeforeEdit === undefined) namesBeforeEdit = lastKnownNames;
     if (editTimer) clearTimeout(editTimer);
     editTimer = setTimeout(flushEdit, EDIT_DEBOUNCE_MS);

@@ -28,6 +28,7 @@ async function replay(steps, variables = []) {
             ...(s.ops ? { ops: s.ops } : {}),
             ...(s.url ? { url: s.url } : {}),
             ...(s.serialized ? { serialized: s.serialized } : {}),
+            ...(s.delta ? { delta: s.delta } : {}),
         })),
     });
     if (!r.ok) throw new Error(`replay: ${r.error}`);
@@ -1367,6 +1368,155 @@ const tests = {
         if (Math.abs(v4 - bigVol) > 1e-6)
             return log.fail(`the plate from the ranged load differs: ${v4} vs ${bigVol}`);
         log.note(`big snapshot ${bigSnap.bytes} B read in ${Math.ceil(bigSnap.bytes / 65536)} ranges`);
+        return log.ok();
+    },
+    // E6 — a hand edit leaves as a DELTA (what the gesture changed, with the value it replaced), not the whole
+    //      document: a move, a feature change and a delete, each replayed onto a fresh build to the same geometry;
+    //      a delta step after a program step applies onto it (no document reset); the delta is kilobytes.
+    async E6(log) {
+        const program = [
+            { op: "sketch", id: "s", plane: "XY", entities: [...rect(0, 0, 60, 40)] },
+            { op: "extrude", id: "plate", sketch: "s", name: "Plate", depth: 3 },
+            {
+                op: "sketch",
+                id: "s2",
+                plane: { base: "XY", offset: 3 },
+                entities: [{ type: "circle", params: [50, 30, 5] }],
+            },
+            { op: "extrude", id: "post", sketch: "s2", name: "Post", depth: 10 },
+        ];
+        const r = await replay([{ id: "p", ops: program }]);
+        if (r.failed.length) return log.fail(r.failed[0].error);
+        const edits = async (since) =>
+            rt.page.evaluate((since) => window.__msgs.filter((m) => m.type === "edit").slice(since), since);
+        const editCount = async () =>
+            rt.page.evaluate(() => window.__msgs.filter((m) => m.type === "edit").length);
+        const waitForEdit = async (n) => {
+            await rt.page.waitForFunction(
+                (n) => window.__msgs.filter((m) => m.type === "edit").length > n,
+                { timeout: 15000 },
+                n,
+            );
+            return (await edits(n))[0];
+        };
+        // 1. a move: the Post's transform, as chili's Move command sets it (one transaction, history on)
+        const bb0 = await bbox("p:post");
+        let n = await editCount();
+        const lift = { __cla$$__: "Matrix4", array: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 25, 1] };
+        await rpc("esoul.simulateEdit", { ops: [{ nodeId: "p:post", property: "transform", value: lift }] });
+        const e1 = await waitForEdit(n);
+        if (e1.serialized !== undefined || !e1.delta)
+            return log.fail(`the move left as ${e1.serialized !== undefined ? "a snapshot" : "no delta"}`);
+        const sets = e1.delta.ops.filter((o) => o.op === "set");
+        if (sets.length !== 1 || sets[0].target.nodeId !== "p:post" || sets[0].property !== "transform")
+            return log.fail(`the move's delta: ${JSON.stringify(e1.delta).slice(0, 200)}`);
+        if (!e1.base?.["node:p:post"]?.transform)
+            return log.fail("the move's delta carries no base transform");
+        const weight = JSON.stringify(e1.delta).length;
+        if (weight > 20_000) return log.fail(`the delta weighs ${weight} chars`);
+        // replayed onto a fresh build: the post sits 25 higher
+        const r2 = await replay([
+            { id: "p", ops: program },
+            { id: "e1", kind: "edit", delta: e1.delta },
+        ]);
+        if (r2.failed.length) return log.fail(`replaying the move: ${r2.failed[0].error}`);
+        const bb1 = await bbox("p:post");
+        if (Math.abs(bb1.max.z - bb0.max.z - 25) > 1e-6)
+            return log.fail(`the replayed move put the post at z ${bb1.max.z} (was ${bb0.max.z})`);
+        if (!r2.applied[1].ok || !r2.applied[1].bodies.some((b) => b.nodeId === "p:post"))
+            return log.fail("the delta step's report does not name the post");
+        // 2. a feature change: the post's extrude depth doubled through featuresJson, as the feature editor sets it
+        const v0 = await volume("p:post");
+        n = await editCount();
+        const features = await rt.page.evaluate(async () => {
+            const id = `feat-${Date.now()}`;
+            window.postMessage(
+                {
+                    esoulCad: 1,
+                    id,
+                    method: "run_parametric",
+                    args: { ops: [{ op: "features", id: "f", body: "p:post" }] },
+                },
+                location.origin,
+            );
+            for (let i = 0; i < 200; i++) {
+                const m = window.__msgs.find((m) => m.id === id && "ok" in m);
+                if (m) return JSON.parse(typeof m.result === "string" ? m.result : m.result.content);
+                await new Promise((r) => setTimeout(r, 50));
+            }
+            return null;
+        });
+        const feats = features?.results?.f;
+        if (!Array.isArray(feats) || !feats.length) return log.fail("could not read the post's features");
+        const doc = JSON.parse(content(await rpc("esoul.serialize", {})));
+        const postNode = doc.models.nodes.find((x) => x.id === "p:post");
+        const current = JSON.parse(postNode.featuresJson);
+        const changed = current.map((f) => (f.type === "extrude" ? { ...f, depth: 20 } : f));
+        await rpc("esoul.simulateEdit", {
+            ops: [{ nodeId: "p:post", property: "featuresJson", value: JSON.stringify(changed) }],
+        });
+        const e2 = await waitForEdit(n);
+        if (!e2.delta || !e2.delta.ops.some((o) => o.op === "set" && o.property === "featuresJson"))
+            return log.fail("the feature change left no featuresJson delta");
+        const r3 = await replay([
+            { id: "p", ops: program },
+            { id: "e1", kind: "edit", delta: e1.delta },
+            { id: "e2", kind: "edit", delta: e2.delta },
+        ]);
+        if (r3.failed.length) return log.fail(`replaying the feature change: ${r3.failed[0].error}`);
+        const v1 = await volume("p:post");
+        if (!(v1 > v0 * 1.9))
+            return log.fail(`the replayed feature change left the post at ${v1} (was ${v0})`);
+        // 3. a delete
+        n = await editCount();
+        await rpc("esoul.simulateEdit", { ops: [{ nodeId: "p:post", remove: true }] });
+        const e3 = await waitForEdit(n);
+        if (!e3.delta || !e3.delta.ops.some((o) => o.op === "remove" && o.nodeId === "p:post"))
+            return log.fail(
+                `the delete left ${JSON.stringify(e3.delta ?? e3.serialized?.length).slice(0, 120)}`,
+            );
+        const r4 = await replay([
+            { id: "p", ops: program },
+            { id: "e3", kind: "edit", delta: e3.delta },
+        ]);
+        if (r4.failed.length) return log.fail(`replaying the delete: ${r4.failed[0].error}`);
+        let gone = false;
+        try {
+            await volume("p:post");
+        } catch {
+            gone = true;
+        }
+        if (!gone) return log.fail("the post is still there after the replayed delete");
+        // 4. applyStep: the move lands on a built document in place
+        const r5 = await replay([{ id: "p", ops: program }]);
+        if (r5.failed.length) return log.fail(r5.failed[0].error);
+        const ap = await rpc("esoul.applyStep", { step: { id: "e1", kind: "edit", delta: e1.delta } });
+        if (!ap.ok) return log.fail(`applyStep: ${ap.error}`);
+        const bb2 = await bbox("p:post");
+        if (Math.abs(bb2.max.z - bb0.max.z - 25) > 1e-6)
+            return log.fail(`applyStep left the post at z ${bb2.max.z}`);
+        const ap2 = await rpc("esoul.applyStep", {
+            step: {
+                id: "q",
+                kind: "program",
+                ops: [
+                    {
+                        op: "sketch",
+                        id: "s3",
+                        plane: "XY",
+                        entities: [{ type: "circle", params: [10, 10, 2] }],
+                    },
+                    { op: "extrude", id: "pin", sketch: "s3", name: "Pin", depth: 6 },
+                ],
+            },
+        });
+        if (!ap2.ok || !JSON.parse(content(ap2)).applied[0].ok)
+            return log.fail(
+                `applyStep program: ${ap2.ok ? JSON.parse(content(ap2)).applied[0].error : ap2.error}`,
+            );
+        const vPin = await volume("q:pin");
+        if (!(vPin > 70)) return log.fail(`the applied program step made a pin of ${vPin}`);
+        log.note(`move delta ${weight} chars; feature delta ${JSON.stringify(e2.delta).length} chars`);
         return log.ok();
     },
     // D1 — esoul.describe: a plate with three holes and a boss is read back as holes (Ø, centre) + a boss + its planes.
