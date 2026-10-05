@@ -47,7 +47,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.36";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.37";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -206,7 +206,16 @@ type DeltaOp =
     | { op: "set"; target: DeltaTarget; property: string; value: unknown }
     | { op: "add"; node: Record<string, unknown>; parentId: string | null; previousId: string | null }
     | { op: "remove"; nodeId: string }
-    | { op: "move"; nodeId: string; parentId: string | null; previousId: string | null };
+    | { op: "move"; nodeId: string; parentId: string | null; previousId: string | null }
+    | {
+          op: "features";
+          target: { nodeId: string };
+          add: { after: string | null; feature: Feature }[];
+          remove: string[];
+          change: { id: string; feature: Feature }[];
+      };
+/** One entry of a parametric body's `featuresJson` (the kernel's own shape; only `id` is read here). */
+type Feature = Record<string, unknown> & { id: string };
 interface EditDelta {
     v: 1;
     ops: DeltaOp[];
@@ -230,6 +239,72 @@ function serializeValue(value: unknown): unknown {
     }
     if (t === "function" || t === "symbol") throw new Error(`unserializable ${t}`);
     return value;
+}
+
+/** A body's `featuresJson` as a list, or null when it is not one list of uniquely identified features. */
+function parseFeatures(s: unknown): Feature[] | null {
+    if (typeof s !== "string") return null;
+    try {
+        const v = JSON.parse(s) as unknown;
+        if (!Array.isArray(v)) return null;
+        const ids = new Set<string>();
+        for (const f of v) {
+            if (!f || typeof f !== "object" || typeof (f as Feature).id !== "string") return null;
+            if (ids.has((f as Feature).id)) return null;
+            ids.add((f as Feature).id);
+        }
+        return v as Feature[];
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * A change of a body's feature list as OPERATIONS on features by id — what was added (after which feature), removed
+ * and changed — so it lands on the list as it IS when applied, not on the list the device saw: a cut an agent put on
+ * the body meanwhile stays. Null when the lists cannot be read that way or the kept features were reordered (then
+ * the whole value is set, as before).
+ */
+function featuresOp(nodeId: string, before: unknown, after: unknown): DeltaOp | null {
+    const b = parseFeatures(before);
+    const a = parseFeatures(after);
+    if (!b || !a) return null;
+    const bById = new Map(b.map((f) => [f.id, f]));
+    const aIds = new Set(a.map((f) => f.id));
+    const keptBefore = b.filter((f) => aIds.has(f.id)).map((f) => f.id);
+    const keptAfter = a.filter((f) => bById.has(f.id)).map((f) => f.id);
+    if (JSON.stringify(keptBefore) !== JSON.stringify(keptAfter)) return null;
+    const add: { after: string | null; feature: Feature }[] = [];
+    const change: { id: string; feature: Feature }[] = [];
+    a.forEach((f, i) => {
+        const old = bById.get(f.id);
+        if (!old) add.push({ after: i > 0 ? a[i - 1].id : null, feature: f });
+        else if (JSON.stringify(old) !== JSON.stringify(f)) change.push({ id: f.id, feature: f });
+    });
+    const remove = b.filter((f) => !aIds.has(f.id)).map((f) => f.id);
+    return { op: "features", target: { nodeId }, add, remove, change };
+}
+
+/** The feature list after a `features` op: removals, then changes (a feature that is gone throws — the step fails
+ *  visibly, never silently), then adds after their anchor (an anchor that is gone puts the feature at the end). */
+function applyFeaturesOp(list: Feature[], op: Extract<DeltaOp, { op: "features" }>): Feature[] {
+    const out = list.filter((f) => !op.remove.includes(f.id));
+    for (const c of op.change) {
+        const i = out.findIndex((f) => f.id === c.id);
+        if (i < 0) throw new Error(`delta: feature ${c.id} is not on the body any more`);
+        out[i] = c.feature;
+    }
+    for (const a of op.add) {
+        if (out.some((f) => f.id === a.feature.id)) continue; // already there (the same op applied twice)
+        if (a.after === null) {
+            out.unshift(a.feature);
+            continue;
+        }
+        const i = out.findIndex((f) => f.id === a.after);
+        if (i < 0) out.push(a.feature);
+        else out.splice(i + 1, 0, a.feature);
+    }
+    return out;
 }
 
 function flattenRecords(record: IHistoryRecord, out: IHistoryRecord[]) {
@@ -326,7 +401,11 @@ function deltaFromRecords(
         const first = serializeValue(s.first);
         const last = serializeValue(s.last);
         if (JSON.stringify(first) === JSON.stringify(last)) continue; // the gesture put it back
-        ops.push({ op: "set", target: s.target, property: s.property, value: last });
+        const asFeatures =
+            s.property === "featuresJson" && "nodeId" in s.target
+                ? featuresOp(s.target.nodeId, first, last)
+                : null;
+        ops.push(asFeatures ?? { op: "set", target: s.target, property: s.property, value: last });
         const tk = targetKey(s.target);
         const forTarget = base[tk] ?? {};
         forTarget[s.property] = first;
@@ -349,7 +428,8 @@ function deltaNodeIds(delta: EditDelta): string[] {
         if (op.op === "add") ids.add(String(op.node.id ?? ""));
         else if (op.op === "set") {
             if ("nodeId" in op.target) ids.add(op.target.nodeId);
-        } else ids.add(op.nodeId);
+        } else if (op.op === "features") ids.add(op.target.nodeId);
+        else ids.add(op.nodeId);
     }
     ids.delete("");
     return [...ids];
@@ -391,6 +471,14 @@ function applyDelta(doc: IDocument, delta: EditDelta): void {
                 if (node.parent) node.parent.move(node, list as never, previous);
                 else if (previous) list.insertAfter(previous, node);
                 else list.add(node);
+            } else if (op.op === "features") {
+                const node = findNode(doc, op.target.nodeId) as
+                    | (INode & { featuresJson?: unknown })
+                    | undefined;
+                if (!node) throw new Error(`delta: no node ${op.target.nodeId} to change features on`);
+                const current = parseFeatures(node.featuresJson);
+                if (!current) throw new Error(`delta: node ${op.target.nodeId} has no feature list`);
+                node.featuresJson = JSON.stringify(applyFeaturesOp(current, op));
             } else {
                 const target: unknown =
                     "nodeId" in op.target

@@ -1456,8 +1456,21 @@ const tests = {
             ops: [{ nodeId: "p:post", property: "featuresJson", value: JSON.stringify(changed) }],
         });
         const e2 = await waitForEdit(n);
-        if (!e2.delta || !e2.delta.ops.some((o) => o.op === "set" && o.property === "featuresJson"))
-            return log.fail("the feature change left no featuresJson delta");
+        // runtime 37: a feature-list change is an OPERATION on features by id, never the whole list
+        const fop = e2.delta?.ops.find((o) => o.op === "features" && o.target.nodeId === "p:post");
+        if (!fop)
+            return log.fail(
+                `the feature change left ${JSON.stringify(e2.delta ?? e2.serialized?.length).slice(0, 160)}`,
+            );
+        if (
+            fop.change.length !== 1 ||
+            fop.add.length !== 0 ||
+            fop.remove.length !== 0 ||
+            fop.change[0].feature.depth !== 20
+        )
+            return log.fail(`the feature change as an op: ${JSON.stringify(fop).slice(0, 200)}`);
+        if (e2.base?.["node:p:post"]?.featuresJson !== postNode.featuresJson)
+            return log.fail("the feature change carries no base list");
         const r3 = await replay([
             { id: "p", ops: program },
             { id: "e1", kind: "edit", delta: e1.delta },
@@ -1516,7 +1529,58 @@ const tests = {
             );
         const vPin = await volume("q:pin");
         if (!(vPin > 70)) return log.fail(`the applied program step made a pin of ${vPin}`);
-        log.note(`move delta ${weight} chars; feature delta ${JSON.stringify(e2.delta).length} chars`);
+        // 5. the feature change COMPOSES with a feature that reached the body meanwhile (an agent's cut): applied onto
+        //    the list as it is, the post ends up with the doubled depth AND the hole — neither side's work is lost
+        const r6 = await replay([{ id: "p", ops: program }]);
+        if (r6.failed.length) return log.fail(r6.failed[0].error);
+        const cut = await rpc("esoul.applyStep", {
+            step: {
+                id: "c",
+                kind: "program",
+                ops: [
+                    {
+                        op: "sketch",
+                        id: "s5",
+                        plane: { base: "XY", offset: 3 },
+                        entities: [{ type: "circle", params: [50, 30, 1.5] }],
+                    },
+                    { op: "extrude", id: "hole", sketch: "s5", body: "p:post", operation: "cut", depth: 30 },
+                ],
+            },
+        });
+        if (!cut.ok || !JSON.parse(content(cut)).applied[0].ok)
+            return log.fail(`the cut: ${cut.ok ? JSON.parse(content(cut)).applied[0].error : cut.error}`);
+        const listWithCut = JSON.parse(
+            JSON.parse(content(await rpc("esoul.serialize", {}))).models.nodes.find((x) => x.id === "p:post")
+                .featuresJson,
+        );
+        if (listWithCut.length !== current.length + 1)
+            return log.fail(
+                `the cut did not join the post's features (${listWithCut.length} vs ${current.length})`,
+            );
+        const vCut = await volume("p:post");
+        const ap3 = await rpc("esoul.applyStep", { step: { id: "e2", kind: "edit", delta: e2.delta } });
+        if (!ap3.ok || !JSON.parse(content(ap3)).applied[0].ok)
+            return log.fail(
+                `the feature change on a body with a new cut: ${ap3.ok ? JSON.parse(content(ap3)).applied[0].error : ap3.error}`,
+            );
+        const both = JSON.parse(
+            JSON.parse(content(await rpc("esoul.serialize", {}))).models.nodes.find((x) => x.id === "p:post")
+                .featuresJson,
+        );
+        const cutId = listWithCut[listWithCut.length - 1].id;
+        if (both.length !== listWithCut.length || !both.some((f) => f.id === cutId))
+            return log.fail("the feature change dropped the cut");
+        if (!both.some((f) => f.type === "extrude" && f.depth === 20))
+            return log.fail("the cut dropped the feature change");
+        const vBoth = await volume("p:post");
+        if (!(vBoth > vCut * 1.9 && vBoth < v1))
+            return log.fail(
+                `post with the doubled depth and the hole: ${vBoth} (hole alone ${vCut}, depth alone ${v1})`,
+            );
+        log.note(
+            `move delta ${weight} chars; feature delta ${JSON.stringify(e2.delta).length} chars; composed ${vBoth.toFixed(0)} < ${v1.toFixed(0)}`,
+        );
         return log.ok();
     },
     // D1 — esoul.describe: a plate with three holes and a boss is read back as holes (Ø, centre) + a boss + its planes.
