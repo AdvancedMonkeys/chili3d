@@ -47,7 +47,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.38";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.39";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);

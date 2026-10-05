@@ -1594,6 +1594,56 @@ const tests = {
         );
         return log.ok();
     },
+    // E8 — a fuse/cut/common extrude appended to a body consumes its sketch like a new body does: the profile must
+    //      not stay drawn as a grey face at its plane (the Bracket rocket's window beside the nose, the Keyboard's
+    //      "white planes", 2026-10-05) — in the live document and after a shapes-snapshot (cache) load.
+    async E8(log) {
+        const program = [
+            { op: "sketch", id: "s", plane: "XY", entities: [...rect(0, 0, 60, 40)] },
+            { op: "extrude", id: "plate", sketch: "s", name: "Plate", depth: 10 },
+            // a window cut from a plane 20 mm OUTSIDE the plate, along +x into it
+            {
+                op: "sketch",
+                id: "sw",
+                plane: { base: "YZ", offset: -20 },
+                entities: [{ type: "circle", params: [20, 5, 3] }],
+            },
+            { op: "extrude", id: "win", sketch: "sw", body: "plate", operation: "cut", depth: 40 },
+            {
+                op: "sketch",
+                id: "sb",
+                plane: { base: "XY", offset: 10 },
+                entities: [{ type: "circle", params: [50, 30, 4] }],
+            },
+            { op: "extrude", id: "boss", sketch: "sb", body: "plate", operation: "fuse", depth: 6 },
+        ];
+        const r = await replay([{ id: "p", ops: program }]);
+        if (r.failed.length) return log.fail(r.failed[0].error);
+        const visibility = async () => {
+            const doc = JSON.parse(content(await rpc("esoul.serialize", {})));
+            const by = (id) => doc.models.nodes.find((n) => n.id === id);
+            return Object.fromEntries(
+                ["p:s", "p:sw", "p:sb"].map((id) => [id, by(id) ? by(id).visible : "missing"]),
+            );
+        };
+        const live = await visibility();
+        for (const [id, v] of Object.entries(live))
+            if (v !== false) return log.fail(`sketch ${id} after the build: visible=${v} (must be false)`);
+        // the sketches were consumed, not dropped: the plate is cut and fused
+        const v = await volume("p:plate");
+        const expected = 60 * 40 * 10 - Math.PI * 9 * 20 + Math.PI * 16 * 6;
+        if (Math.abs(v - expected) > 1) return log.fail(`plate volume ${v}, expected ${expected.toFixed(1)}`);
+        // the same after a cache load
+        const full = JSON.parse(content(await rpc("esoul.snapshot", { shapes: true })));
+        const r2 = await replay([{ id: "c", kind: "edit", serialized: full.serialized }]);
+        if (r2.failed.length) return log.fail(`cache load: ${r2.failed[0].error}`);
+        const loaded = await visibility();
+        for (const [id, v2] of Object.entries(loaded))
+            if (v2 !== false)
+                return log.fail(`sketch ${id} after the cache load: visible=${v2} (must be false)`);
+        log.note(`three consumed sketches hidden live and after the cache load; plate ${v.toFixed(0)} mm³`);
+        return log.ok();
+    },
     // D1 — esoul.describe: a plate with three holes and a boss is read back as holes (Ø, centre) + a boss + its planes.
     async D1(log) {
         const r = await replay([

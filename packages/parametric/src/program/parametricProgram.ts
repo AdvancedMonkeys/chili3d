@@ -632,6 +632,9 @@ function runExtrudeOp(state: State, op: ExtrudeOp): void {
     }
     const body = resolveBody(state, op.body);
     appendFeature(state, body, { ...feature, operation: op.operation });
+    // Consumed like a new body's sketch: a cutter's profile left drawn is a grey disc beside the part it cut (the
+    // Bracket rocket's window, the Keyboard's "white planes", 2026-10-05).
+    sketch.visible = false;
     // An op that edits a body is registered as another name for it, so a later op can
     // reference the result of this one the same way it references a freshly built body.
     state.refs.set(op.id, body.id);
