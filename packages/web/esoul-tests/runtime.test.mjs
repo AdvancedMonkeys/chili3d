@@ -1399,9 +1399,20 @@ const tests = {
             );
             return (await edits(n))[0];
         };
+        // runtime 38: a parent that never said it takes deltas gets the snapshot shape it always did (an older
+        // app build open across a runtime deploy) — only `esoul.accept { delta:true }` switches to deltas
+        let n = await editCount();
+        await rpc("esoul.simulateEdit", {
+            ops: [{ nodeId: "p:post", property: "name", value: "Post (named)" }],
+        });
+        const e0 = await waitForEdit(n);
+        if (e0.serialized === undefined || e0.delta)
+            return log.fail("before esoul.accept an edit must leave as a snapshot (an older parent's shape)");
+        const acc = await rpc("esoul.accept", { delta: true });
+        if (!acc.ok) return log.fail(`esoul.accept: ${acc.error}`);
         // 1. a move: the Post's transform, as chili's Move command sets it (one transaction, history on)
         const bb0 = await bbox("p:post");
-        let n = await editCount();
+        n = await editCount();
         const lift = { __cla$$__: "Matrix4", array: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 25, 1] };
         await rpc("esoul.simulateEdit", { ops: [{ nodeId: "p:post", property: "transform", value: lift }] });
         const e1 = await waitForEdit(n);

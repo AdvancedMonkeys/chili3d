@@ -47,7 +47,7 @@ import { Loading } from "./loading";
 
 const TAG = "esoulCad";
 const VERSION = 1;
-const RUNTIME_VERSION = "chili3d-0.7.1+esoul.37";
+const RUNTIME_VERSION = "chili3d-0.7.1+esoul.38";
 const EDIT_DEBOUNCE_MS = 1200;
 
 const params = new URLSearchParams(window.location.search);
@@ -63,6 +63,10 @@ let app: IApplication | undefined;
 let tools: Tool[] = [];
 /** True while the bridge itself mutates the document (a replay, a tool call): those are not a person's edits. */
 let driving = 0;
+/** The parent said (`esoul.accept { delta:true }`) it takes a hand edit as a DELTA. Until it does, an edit leaves as
+ *  the whole-document snapshot it always did — a tab holding an older app build across a runtime deploy keeps
+ *  recording its edits instead of throwing on a shape it never asked for (lesson 2, learned twice). */
+let parentAcceptsDelta = false;
 
 function post(message: Record<string, unknown>) {
     if (!parentOrigin) return;
@@ -1447,6 +1451,9 @@ async function dispatch(method: string, args: Record<string, unknown>): Promise<
             return JSON.stringify(activeDocument().serialize());
         case "esoul.snapshot":
             return snapshot(args as { shapes?: boolean; chunked?: boolean; chunkBytes?: number });
+        case "esoul.accept":
+            parentAcceptsDelta = !!(args as { delta?: unknown })["delta"];
+            return JSON.stringify({ ok: true, delta: parentAcceptsDelta });
         case "esoul.theme":
             applyThemeMode(args["mode"]);
             return JSON.stringify({ ok: true, mode: Config.instance.themeMode });
@@ -1568,7 +1575,7 @@ function flushEdit() {
         const after = topNames(doc);
         let packed: { delta: EditDelta; base: EditBase } | null = null;
         try {
-            packed = deltaFromRecords(doc, records);
+            packed = parentAcceptsDelta ? deltaFromRecords(doc, records) : null;
         } catch (err) {
             Logger.warn(
                 `esoul edit: no delta for this gesture (${(err as Error).message}); sending the snapshot`,
