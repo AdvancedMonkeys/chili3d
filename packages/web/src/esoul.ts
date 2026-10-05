@@ -425,7 +425,7 @@ function deltaFromRecords(
 function deltaNodeIds(delta: EditDelta): string[] {
     const ids = new Set<string>();
     for (const op of delta.ops) {
-        if (op.op === "add") ids.add(String(op.node.id ?? ""));
+        if (op.op === "add") ids.add(String(op.node["id"] ?? ""));
         else if (op.op === "set") {
             if ("nodeId" in op.target) ids.add(op.target.nodeId);
         } else if (op.op === "features") ids.add(op.target.nodeId);
